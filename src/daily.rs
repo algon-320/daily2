@@ -6,14 +6,10 @@ use x11rb::protocol::{xproto, Event};
 use x11rb::rust_connection::RustConnection;
 use xproto::ConnectionExt as _;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 x11rb::atom_manager! {
-    pub AtomCollection: AtomCollectionCookie {
-        WM_STATE,
-        _NET_WM_WINDOW_TYPE,
-        _NET_WM_WINDOW_TYPE_DIALOG,
-    }
+    pub AtomCollection: AtomCollectionCookie {}
 }
 
 #[derive(Clone)]
@@ -24,7 +20,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn init() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let conn = match RustConnection::connect(None) {
             Ok((conn, _)) => conn,
             Err(err) => {
@@ -44,6 +40,7 @@ impl Context {
 #[derive(Debug, Clone)]
 pub enum Command {
     Exit,
+    Restart,
 }
 
 pub struct Daily {
@@ -52,47 +49,35 @@ pub struct Daily {
     cmdq: VecDeque<Command>,
 }
 
+// public interfaces
 impl Daily {
     pub fn new() -> Result<Self> {
-        let ctx = Context::init()?;
         Ok(Self {
-            ctx,
+            ctx: Context::new()?,
             keybind: HashMap::new(),
             cmdq: VecDeque::new(),
         })
     }
 
-    pub fn bind_key(&mut self, mo: xproto::ModMask, keycode: u8, cmd: Command) -> Result<()> {
-        log::info!("new keybind added: state={mo:?}, detail={keycode}, cmd={cmd:?}");
-
+    pub fn bind_key(&mut self, modif: xproto::ModMask, keycode: u8, cmd: Command) -> Result<()> {
         let async_ = xproto::GrabMode::ASYNC;
         let root = self.ctx.root;
         self.ctx
             .conn
-            .grab_key(true, root, mo, keycode, async_, async_)?
+            .grab_key(true, root, modif, keycode, async_, async_)?
             .check()?;
 
-        let state: u16 = mo.into();
-        self.keybind.insert((state, keycode), cmd);
+        self.keybind.insert((modif.into(), keycode), cmd.clone());
+
+        log::info!("new keybinding: state={modif:?}, detail={keycode}, cmd={cmd:?}");
         Ok(())
     }
 
     pub fn start(mut self) -> Result<()> {
-        log::info!("daily started");
-
         loop {
             let event = self.ctx.conn.wait_for_event()?;
             self.handle_event(event)?;
-            self.ctx.conn.flush()?;
-
-            for cmd in self.cmdq.drain(..) {
-                log::debug!("cmd={cmd:?}");
-                match cmd {
-                    Command::Exit => {
-                        return Ok(());
-                    }
-                }
-            }
+            self.process_cmdq()?;
         }
     }
 }
@@ -107,6 +92,21 @@ impl Daily {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn process_cmdq(&mut self) -> Result<()> {
+        for cmd in self.cmdq.drain(..) {
+            log::debug!("cmd={cmd:?}");
+            match cmd {
+                Command::Exit => {
+                    return Err(Error::Interrupted { restart: false });
+                }
+                Command::Restart => {
+                    return Err(Error::Interrupted { restart: true });
+                }
+            }
         }
         Ok(())
     }

@@ -2,6 +2,9 @@ use x11rb::errors::ReplyOrIdError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("interrupted by user")]
+    Interrupted { restart: bool },
+
     #[error(transparent)]
     X11(ReplyOrIdError),
 }
