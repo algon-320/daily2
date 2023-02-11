@@ -48,31 +48,41 @@ pub enum Command {
     FocusNextWindow,
     ChangeScreen(usize),
     MoveWindow(usize),
+    ToggleFloating,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Rect {
+    fn top(&self) -> i32 {
+        self.y
+    }
+    fn bottom(&self) -> i32 {
+        self.y + self.h
+    }
+    fn left(&self) -> i32 {
+        self.x
+    }
+    fn right(&self) -> i32 {
+        self.x + self.w
+    }
+    fn contains(&self, x: i32, y: i32) -> bool {
+        self.left() <= x && x < self.right() && self.top() <= y && y < self.bottom()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Monitor {
-    x: i16,
-    y: i16,
-    w: u16,
-    h: u16,
+    crtc: randr::Crtc,
     screen: usize,
     dummy_window: xproto::Window,
-}
-
-impl Monitor {
-    fn top(&self) -> i32 {
-        self.y as i32
-    }
-    fn bottom(&self) -> i32 {
-        self.y as i32 + self.h as i32
-    }
-    fn left(&self) -> i32 {
-        self.x as i32
-    }
-    fn right(&self) -> i32 {
-        self.x as i32 + self.w as i32
-    }
+    geometry: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +95,15 @@ struct Window {
     id: xproto::Window,
     screen: usize,
     mapped: bool,
+    geometry: Rect,
+    floating: bool,
+
+    // NOTE:
+    // X11 core protocol does not provide a way to determine if an UnmapNotifyEvent was caused by
+    // by this client or aother client. We are only interestead in the latter case,
+    // so when we (actively) unmap a window turn on this flag and test it on UnmapNotifyEvents.
+    // Is there any better way to deal with this issue?
+    ignore_unmap_notify: bool,
 }
 
 pub struct Daily {
@@ -94,6 +113,8 @@ pub struct Daily {
     monitors: Vec<Monitor>,
     screens: Vec<Screen>,
     focus: xproto::Window,
+    dnd_position: Option<(i32, i32)>,
+    button_count: usize,
 }
 
 // public interfaces
@@ -106,6 +127,8 @@ impl Daily {
             monitors: Vec::new(),
             screens: Vec::new(),
             focus: x11rb::NONE,
+            dnd_position: None,
+            button_count: 0,
         })
     }
 
@@ -160,74 +183,55 @@ impl Daily {
             self.ctx.conn.flush()?;
         }
 
-        // setup monitors
+        // setup for screens
         {
-            let mut monitors = self
-                .ctx
-                .conn
-                .randr_get_monitors(self.ctx.root, true)?
-                .reply()?
-                .monitors;
-
-            if let Some(primary_idx) = monitors.iter().position(|minfo| minfo.primary) {
-                monitors.swap(0, primary_idx);
-            }
-
-            self.monitors.clear();
-            for (i, mon) in monitors.into_iter().enumerate() {
-                let dummy_window = self.ctx.conn.generate_id()?;
-                log::debug!("dummy window for monitor {i}: {dummy_window}");
-
-                let depth = x11rb::COPY_DEPTH_FROM_PARENT;
-                let class = xproto::WindowClass::INPUT_ONLY;
-                let visual = x11rb::COPY_FROM_PARENT;
-                let aux = xproto::CreateWindowAux::new();
-                self.ctx.conn.create_window(
-                    depth,
-                    dummy_window,
-                    self.ctx.root,
-                    mon.x, // x
-                    mon.y, // y
-                    1,     // width
-                    1,     // height
-                    0,     // border-width
-                    class,
-                    visual,
-                    &aux,
-                )?;
-                self.ctx.conn.map_window(dummy_window)?;
-
-                self.monitors.push(Monitor {
-                    x: mon.x,
-                    y: mon.y,
-                    w: mon.width,
-                    h: mon.height,
-                    screen: i,
-                    dummy_window,
-                });
-            }
+            const NUM_SCREENS: usize = 100;
+            self.screens = vec![Screen { monitor: None }; NUM_SCREENS];
         }
 
-        // setup screens
+        // setup for monitors
         {
-            const NUM_SCREENS: usize = 3;
-            let num_screens = std::cmp::max(self.monitors.len(), NUM_SCREENS);
-            let num_monitors = self.monitors.len();
+            // NOTE: randr version 1.2 or later
+            self.ctx
+                .conn
+                .randr_select_input(self.ctx.root, randr::NotifyMask::CRTC_CHANGE)?;
 
-            self.screens.clear();
-            for i in 0..num_screens {
-                let scr = if i < num_monitors {
-                    Screen { monitor: Some(i) }
-                } else {
-                    Screen { monitor: None }
+            let crtcs = self
+                .ctx
+                .conn
+                .randr_get_screen_resources_current(self.ctx.root)?
+                .reply()?
+                .crtcs;
+
+            self.monitors.clear();
+            for (i, crtc) in crtcs.into_iter().enumerate() {
+                let crtc_info = self
+                    .ctx
+                    .conn
+                    .randr_get_crtc_info(crtc, x11rb::CURRENT_TIME)?
+                    .reply()?;
+                log::debug!("Crtc {crtc}: {crtc_info:?}");
+
+                if crtc_info.mode == x11rb::NONE {
+                    // ignore disabled CRTCs
+                    continue;
+                }
+
+                let geometry = Rect {
+                    x: crtc_info.x as i32,
+                    y: crtc_info.y as i32,
+                    w: crtc_info.width as i32,
+                    h: crtc_info.height as i32,
                 };
-                self.screens.push(scr);
+                self.add_monitor(crtc, geometry, i)?;
             }
         }
 
         // grab mouse button(s)
         {
-            let event_mask = xproto::EventMask::BUTTON_PRESS;
+            let event_mask = xproto::EventMask::BUTTON_PRESS
+                | xproto::EventMask::BUTTON_RELEASE
+                | xproto::EventMask::BUTTON_MOTION;
             self.ctx
                 .conn
                 .grab_button(
@@ -238,18 +242,55 @@ impl Daily {
                     xproto::GrabMode::ASYNC, // keyboard
                     x11rb::NONE,
                     x11rb::NONE,
-                    xproto::ButtonIndex::M1,
-                    xproto::ModMask::default(),
+                    xproto::ButtonIndex::ANY,
+                    xproto::ModMask::ANY,
                 )?
                 .check()?;
         }
 
+        // focus the first monitor
         {
             let dummy = self.monitors[0].dummy_window;
             self.change_focus(dummy)?;
         }
 
         self.ctx.conn.flush()?;
+        Ok(())
+    }
+
+    fn add_monitor(&mut self, crtc: randr::Crtc, geometry: Rect, screen: usize) -> Result<()> {
+        let i = self.monitors.len();
+        let dummy_window = self.ctx.conn.generate_id()?;
+        log::debug!("dummy window for monitor {i}: {dummy_window}");
+
+        let depth = x11rb::COPY_DEPTH_FROM_PARENT;
+        let class = xproto::WindowClass::INPUT_ONLY;
+        let visual = x11rb::COPY_FROM_PARENT;
+        let aux = xproto::CreateWindowAux::new();
+        self.ctx.conn.create_window(
+            depth,
+            dummy_window,
+            self.ctx.root,
+            geometry.x as i16, // x
+            geometry.y as i16, // y
+            1,                 // width
+            1,                 // height
+            0,                 // border-width
+            class,
+            visual,
+            &aux,
+        )?;
+        self.ctx.conn.map_window(dummy_window)?;
+
+        self.monitors.push(Monitor {
+            crtc,
+            screen,
+            dummy_window,
+            geometry,
+        });
+        self.screens[screen].monitor = Some(i);
+
+        self.update_layout(i)?;
         Ok(())
     }
 
@@ -265,29 +306,185 @@ impl Daily {
 
             Event::ButtonPress(button_press) => {
                 log::trace!("ButtonPress: {event:?}");
+                self.button_count += 1;
 
-                if button_press.child == self.ctx.root
-                    || (button_press.child == x11rb::NONE && button_press.event == self.ctx.root)
-                {
-                    let y = button_press.root_y as i32;
-                    let x = button_press.root_x as i32;
-                    let mon = self
-                        .monitors
-                        .iter()
-                        .position(|mon| {
-                            mon.top() <= y && y < mon.bottom() && mon.left() <= x && x < mon.right()
-                        })
-                        .unwrap_or(0);
-                    let dummy = self.monitors[mon].dummy_window;
-                    self.change_focus(dummy)?;
-                } else {
-                    self.change_focus(button_press.child)?;
+                let x = button_press.root_x as i32;
+                let y = button_press.root_y as i32;
+                let clicked_window =
+                    if button_press.child == x11rb::NONE && button_press.event == self.ctx.root {
+                        self.ctx.root
+                    } else {
+                        button_press.child
+                    };
+
+                let mut allow = xproto::Allow::REPLAY_POINTER;
+
+                const LEFT_BUTTON: u8 = 1;
+                const RIGHT_BUTTON: u8 = 3;
+                // FIXME: config
+                if button_press.detail == LEFT_BUTTON || button_press.detail == RIGHT_BUTTON {
+                    if clicked_window == self.ctx.root {
+                        let mon = self
+                            .monitors
+                            .iter()
+                            .position(|mon| {
+                                mon.geometry.top() <= y
+                                    && y < mon.geometry.bottom()
+                                    && mon.geometry.left() <= x
+                                    && x < mon.geometry.right()
+                            })
+                            .unwrap_or(0);
+                        let dummy = self.monitors[mon].dummy_window;
+                        self.change_focus(dummy)?;
+                    } else {
+                        self.change_focus(clicked_window)?;
+                    }
                 }
 
-                self.ctx
-                    .conn
-                    .allow_events(xproto::Allow::REPLAY_POINTER, x11rb::CURRENT_TIME)?;
+                // FIXME: config
+                if u16::from(button_press.state) & u16::from(xproto::KeyButMask::MOD1) > 0 {
+                    self.dnd_position = Some((x, y));
+                    allow = xproto::Allow::SYNC_POINTER;
+                }
+
+                self.ctx.conn.allow_events(allow, x11rb::CURRENT_TIME)?;
                 self.ctx.conn.flush()?;
+            }
+
+            Event::MotionNotify(motion) => {
+                log::debug!("MotionNotify: {motion:?}");
+                if let Some((prev_x, prev_y)) = self.dnd_position {
+                    let x = motion.root_x as i32;
+                    let y = motion.root_y as i32;
+                    self.dnd_position = Some((x, y));
+
+                    let dx = x - prev_x;
+                    let dy = y - prev_y;
+
+                    if let Some(window) = self.windows.get_mut(&self.focus) {
+                        if !window.floating {
+                            window.floating = true;
+                            if let Some(monitor) = self.screens[window.screen].monitor {
+                                self.update_layout(monitor)?;
+                            }
+                        }
+                    }
+
+                    if let Some(window) = self.windows.get_mut(&self.focus) {
+                        let state = u16::from(motion.state);
+                        let button1 = u16::from(xproto::KeyButMask::BUTTON1);
+                        let button3 = u16::from(xproto::KeyButMask::BUTTON3);
+
+                        if state & button1 > 0 {
+                            window.geometry.x += dx;
+                            window.geometry.y += dy;
+                        } else if state & button3 > 0 {
+                            window.geometry.w += dx;
+                            window.geometry.h += dy;
+                        }
+
+                        let aux = xproto::ConfigureWindowAux::new()
+                            .x(window.geometry.x)
+                            .y(window.geometry.y)
+                            .width(window.geometry.w as u32)
+                            .height(window.geometry.h as u32)
+                            .stack_mode(xproto::StackMode::ABOVE);
+                        self.ctx.conn.configure_window(window.id, &aux)?;
+                        self.ctx.conn.flush()?;
+                    }
+                }
+            }
+
+            Event::ButtonRelease(button_release) => {
+                log::debug!("ButtonRelease: {button_release:?}");
+                self.button_count -= 1;
+
+                let x = button_release.root_x as i32;
+                let y = button_release.root_y as i32;
+
+                if button_release.detail == 1 {
+                    if let Some(window) = self.windows.get_mut(&self.focus) {
+                        for mon in self.monitors.iter() {
+                            if !mon.geometry.contains(x, y) {
+                                continue;
+                            }
+
+                            // FIXME: config
+                            let d = 32;
+                            let border_width = 1;
+
+                            let g = mon.geometry;
+                            let left = g.left() <= x && x < g.left() + d;
+                            let right = g.right() - d <= x && x < g.right();
+                            let top = g.top() <= y && y < g.top() + d;
+                            let bottom = g.bottom() - d <= y && y < g.bottom();
+
+                            if left && top {
+                                window.geometry.x = g.left();
+                                window.geometry.y = g.top();
+                                window.geometry.w = g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h / 2 - border_width * 2;
+                            } else if left && bottom {
+                                window.geometry.x = g.left();
+                                window.geometry.y = g.top() + g.h / 2;
+                                window.geometry.w = g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h - g.h / 2 - border_width * 2;
+                            } else if right && top {
+                                window.geometry.x = g.left() + g.w / 2;
+                                window.geometry.y = g.top();
+                                window.geometry.w = g.w - g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h / 2 - border_width * 2;
+                            } else if right && bottom {
+                                window.geometry.x = g.left() + g.w / 2;
+                                window.geometry.y = g.top() + g.h / 2;
+                                window.geometry.w = g.w - g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h - g.h / 2 - border_width * 2;
+                            } else if left {
+                                window.geometry.x = g.left();
+                                window.geometry.y = g.top();
+                                window.geometry.w = g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h - border_width * 2;
+                            } else if right {
+                                window.geometry.x = g.left() + g.w / 2;
+                                window.geometry.y = g.top();
+                                window.geometry.w = g.w - g.w / 2 - border_width * 2;
+                                window.geometry.h = g.h - border_width * 2;
+                            } else if top {
+                                window.geometry.x = g.left();
+                                window.geometry.y = g.top();
+                                window.geometry.w = g.w - border_width * 2;
+                                window.geometry.h = g.h / 2 - border_width * 2;
+                            } else if bottom {
+                                window.geometry.x = g.left();
+                                window.geometry.y = g.top() + g.h / 2;
+                                window.geometry.w = g.w - border_width * 2;
+                                window.geometry.h = g.h - g.h / 2 - border_width * 2;
+                            } else {
+                                break;
+                            }
+
+                            let aux = xproto::ConfigureWindowAux::new()
+                                .x(window.geometry.x)
+                                .y(window.geometry.y)
+                                .width(window.geometry.w as u32)
+                                .height(window.geometry.h as u32)
+                                .stack_mode(xproto::StackMode::ABOVE);
+                            self.ctx.conn.configure_window(window.id, &aux)?;
+                            self.ctx.conn.flush()?;
+                        }
+                    }
+                }
+
+                if self.button_count > 0 {
+                    self.ctx
+                        .conn
+                        .allow_events(xproto::Allow::SYNC_POINTER, x11rb::CURRENT_TIME)?;
+                    self.ctx.conn.flush()?;
+                }
+
+                if self.button_count == 0 {
+                    self.dnd_position = None;
+                }
             }
 
             Event::MapRequest(req) => {
@@ -305,13 +502,16 @@ impl Daily {
                         self.change_focus(window_id)?;
                     }
                 } else {
-                    let monitor = self.focused_monitor()?.unwrap_or(0);
+                    let monitor = self.focused_monitor().unwrap_or(0);
                     let screen = self.monitors[monitor].screen;
 
                     let window = Window {
                         id: req.window,
                         screen,
                         mapped: true,
+                        geometry: Rect::default(),
+                        floating: false, // FIXME: true if it's a dialog window
+                        ignore_unmap_notify: false,
                     };
 
                     let window_id = window.id;
@@ -326,9 +526,27 @@ impl Daily {
 
             Event::UnmapNotify(notif) => {
                 if let Some(window) = self.windows.get_mut(&notif.window) {
-                    if self.screens[window.screen].monitor.is_some() {
-                        log::debug!("window 0x{:X} is unmapped", window.id);
-                        window.mapped = false;
+                    if window.ignore_unmap_notify {
+                        window.ignore_unmap_notify = false;
+                    } else {
+                        if let Some(monitor) = self.screens[window.screen].monitor {
+                            log::debug!("window 0x{:X} is unmapped", window.id);
+                            window.mapped = false;
+
+                            let screen = window.screen;
+                            if self.focus == window.id {
+                                let any_window_on_screen: xproto::Window = self
+                                    .windows
+                                    .values()
+                                    .filter(|win| win.screen == screen && win.mapped)
+                                    .map(|win| win.id)
+                                    .next()
+                                    .unwrap_or_else(|| self.monitors[monitor].dummy_window);
+                                self.change_focus(any_window_on_screen)?;
+                            }
+
+                            self.update_layout(monitor)?;
+                        }
                     }
                 } else {
                     log::warn!("UnmapNotify: unknown window 0x{:X}", notif.window);
@@ -341,6 +559,85 @@ impl Daily {
 
             Event::Error(err) => {
                 log::error!("X11 error: {err:?}");
+            }
+
+            Event::RandrNotify(notify) => {
+                if notify.sub_code == randr::Notify::CRTC_CHANGE {
+                    let crtc_change = notify.u.as_cc();
+                    log::debug!("RRCrtcChangeNotify: {crtc_change:?}");
+
+                    let crtc = crtc_change.crtc;
+                    if let Some(monitor) = self.monitors.iter().position(|mon| mon.crtc == crtc) {
+                        if crtc_change.mode == x11rb::NONE {
+                            // monitor was disabled
+
+                            let screen = self.monitors[monitor].screen;
+                            let wins: Vec<xproto::Window> = self
+                                .windows
+                                .values()
+                                .filter(|win| win.screen == screen && win.mapped)
+                                .map(|win| win.id)
+                                .collect();
+
+                            for window_id in wins {
+                                if self.focus == window_id {
+                                    self.change_focus(x11rb::NONE)?;
+                                }
+                                self.windows
+                                    .get_mut(&window_id)
+                                    .unwrap()
+                                    .ignore_unmap_notify = true;
+                                self.ctx.conn.unmap_window(window_id)?;
+                            }
+                            self.ctx.conn.flush()?;
+
+                            self.screens[screen].monitor = None;
+
+                            self.ctx
+                                .conn
+                                .destroy_window(self.monitors[monitor].dummy_window)?;
+
+                            self.monitors.swap_remove(monitor);
+                            if monitor < self.monitors.len() {
+                                let screen = self.monitors[monitor].screen;
+                                self.screens[screen].monitor = Some(monitor);
+                            }
+                        } else {
+                            // monitor info was changed
+                            let geometry = &mut self.monitors.get_mut(monitor).unwrap().geometry;
+                            geometry.x = crtc_change.x as i32;
+                            geometry.y = crtc_change.y as i32;
+                            geometry.w = crtc_change.width as i32;
+                            geometry.h = crtc_change.height as i32;
+                            self.update_layout(monitor)?;
+                        }
+                    } else {
+                        // monitor was enabled
+
+                        let unmapped_screen = self
+                            .screens
+                            .iter()
+                            .position(|scr| scr.monitor.is_none())
+                            .expect("too many monitors");
+                        let geometry = Rect {
+                            x: crtc_change.x as i32,
+                            y: crtc_change.y as i32,
+                            w: crtc_change.width as i32,
+                            h: crtc_change.height as i32,
+                        };
+                        self.add_monitor(crtc, geometry, unmapped_screen)?;
+
+                        for window in self
+                            .windows
+                            .values()
+                            .filter(|win| win.screen == unmapped_screen && win.mapped)
+                            .map(|win| win.id)
+                        {
+                            self.ctx.conn.map_window(window)?;
+                        }
+                        self.ctx.conn.flush()?;
+                    }
+                }
             }
 
             _ => {
@@ -375,7 +672,7 @@ impl Daily {
 
                 Command::FocusNextMonitor => {
                     let next = self
-                        .focused_monitor()?
+                        .focused_monitor()
                         .map(|i| (i + 1) % self.monitors.len())
                         .unwrap_or(0);
 
@@ -383,7 +680,7 @@ impl Daily {
                     let any_window_on_next_monitor: xproto::Window = self
                         .windows
                         .values()
-                        .filter(|win| win.screen == screen)
+                        .filter(|win| win.screen == screen && win.mapped)
                         .map(|win| win.id)
                         .next()
                         .unwrap_or_else(|| self.monitors[next].dummy_window);
@@ -398,7 +695,7 @@ impl Daily {
                         let windows: Vec<xproto::Window> = self
                             .windows
                             .values()
-                            .filter(|win| win.screen == screen)
+                            .filter(|win| win.screen == screen && win.mapped)
                             .map(|win| win.id)
                             .collect();
 
@@ -418,7 +715,7 @@ impl Daily {
                 Command::ChangeScreen(new_screen) => {
                     if let Some(monitor_a) = self.screens[new_screen].monitor {
                         let screen_a = new_screen;
-                        let monitor_b = self.focused_monitor()?.unwrap_or(0);
+                        let monitor_b = self.focused_monitor().unwrap_or(0);
                         let screen_b = self.monitors[monitor_b].screen;
 
                         self.monitors[monitor_a].screen = screen_b;
@@ -431,23 +728,28 @@ impl Daily {
                         let any_window_on_new_screen: xproto::Window = self
                             .windows
                             .values()
-                            .filter(|win| win.screen == new_screen)
+                            .filter(|win| win.screen == new_screen && win.mapped)
                             .map(|win| win.id)
                             .next()
                             .unwrap_or_else(|| self.monitors[monitor_b].dummy_window);
                         self.change_focus(any_window_on_new_screen)?;
                     } else {
-                        let monitor = self.focused_monitor()?.unwrap_or(0);
+                        let monitor = self.focused_monitor().unwrap_or(0);
                         let current_screen = self.monitors[monitor].screen;
 
                         for window in self
                             .windows
                             .values_mut()
-                            .filter(|w| w.screen == current_screen)
+                            .filter(|win| win.screen == current_screen && win.mapped)
                         {
+                            window.ignore_unmap_notify = true;
                             self.ctx.conn.unmap_window(window.id)?;
                         }
-                        for window in self.windows.values_mut().filter(|w| w.screen == new_screen) {
+                        for window in self
+                            .windows
+                            .values_mut()
+                            .filter(|win| win.screen == new_screen && win.mapped)
+                        {
                             self.ctx.conn.map_window(window.id)?;
                         }
                         self.ctx.conn.flush()?;
@@ -460,7 +762,7 @@ impl Daily {
                         let any_window_on_new_screen: xproto::Window = self
                             .windows
                             .values()
-                            .filter(|win| win.screen == new_screen)
+                            .filter(|win| win.screen == new_screen && win.mapped)
                             .map(|win| win.id)
                             .next()
                             .unwrap_or_else(|| self.monitors[monitor].dummy_window);
@@ -476,6 +778,7 @@ impl Daily {
 
                         window.screen = new_screen;
                         if new_monitor.is_none() {
+                            window.ignore_unmap_notify = true;
                             self.ctx.conn.unmap_window(window.id)?;
                             self.ctx.conn.flush()?;
                         }
@@ -486,17 +789,20 @@ impl Daily {
                         if let Some(mon) = new_monitor {
                             self.update_layout(mon)?;
                         }
+                    }
+                }
 
-                        let any_window_on_screen: xproto::Window = self
-                            .windows
-                            .values()
-                            .filter(|win| win.screen == old_screen)
-                            .map(|win| win.id)
-                            .next()
-                            .unwrap_or_else(|| {
-                                self.monitors[old_monitor.expect("focus")].dummy_window
-                            });
-                        self.change_focus(any_window_on_screen)?;
+                Command::ToggleFloating => {
+                    if let Some(window) = self.windows.get_mut(&self.focus) {
+                        window.floating ^= true;
+                        if window.floating {
+                            let aux = xproto::ConfigureWindowAux::new()
+                                .stack_mode(xproto::StackMode::ABOVE);
+                            self.ctx.conn.configure_window(window.id, &aux)?;
+                        }
+                        if let Some(monitor) = self.screens[window.screen].monitor {
+                            self.update_layout(monitor)?;
+                        }
                     }
                 }
             }
@@ -508,7 +814,12 @@ impl Daily {
         let old_focus = self.focus;
         let new_focus = focus;
 
-        log::debug!("focus window 0x{:X} ({})", new_focus, new_focus);
+        if old_focus == new_focus {
+            return Ok(());
+        }
+        self.focus = new_focus;
+
+        log::debug!("focus on window 0x{:X} ({})", new_focus, new_focus);
         // TODO: config
         if self.windows.contains_key(&old_focus) {
             let aux = xproto::ChangeWindowAttributesAux::new().border_pixel(0x000000);
@@ -527,7 +838,6 @@ impl Daily {
                 x11rb::CURRENT_TIME,
             )?
             .check()?;
-        self.focus = new_focus;
         Ok(())
     }
 
@@ -537,16 +847,8 @@ impl Daily {
             log::debug!("window 0x{:X} removed from screen {}", window.id, screen);
             if let Some(monitor) = self.screens[screen].monitor {
                 self.update_layout(monitor)?;
-
                 if self.focus == window.id {
-                    let new_focus: xproto::Window = self
-                        .windows
-                        .values()
-                        .filter(|win| win.screen == screen)
-                        .map(|win| win.id)
-                        .next()
-                        .unwrap_or_else(|| self.monitors[monitor].dummy_window);
-                    self.change_focus(new_focus)?;
+                    self.change_focus(x11rb::NONE)?;
                 }
             }
         }
@@ -554,33 +856,44 @@ impl Daily {
     }
 
     fn update_layout(&mut self, monitor: usize) -> Result<()> {
+        log::trace!("update_layout: {monitor}");
+
         let screen = self.monitors[monitor].screen;
+        let mon_geo = self.monitors[monitor].geometry;
+
         let targets: Vec<xproto::Window> = self
             .windows
             .values()
-            .filter(|win| win.screen == screen)
+            .filter(|win| win.screen == screen && win.mapped)
+            .filter(|win| !win.floating)
             .map(|win| win.id)
             .collect();
-
-        let mon = &self.monitors[monitor];
 
         // NOTE: horizontal layout
         if !targets.is_empty() {
             let n = targets.len();
-            let each_w = (mon.w / n as u16) as u32;
-            let last_w = (mon.w as u32) - (n as u32 - 1) * each_w;
-            let each_h = mon.h as u32;
+            let each_w = mon_geo.w / n as i32;
+            let last_w = mon_geo.w - (n as i32 - 1) * each_w;
+            let each_h = mon_geo.h;
 
             for (i, win) in targets.into_iter().enumerate() {
-                let x = (mon.x as i32) + (each_w as i32) * (i as i32);
-                let y = mon.y as i32;
+                let x = mon_geo.x + each_w * (i as i32);
+                let y = mon_geo.y;
                 let w = if i < n - 1 { each_w } else { last_w };
 
+                let geo = Rect {
+                    x,
+                    y,
+                    w: w - 2,
+                    h: each_h - 2,
+                };
+                self.windows.get_mut(&win).unwrap().geometry = geo;
+
                 let aux = xproto::ConfigureWindowAux::new()
-                    .x(x)
-                    .y(y)
-                    .width(w - 2)
-                    .height(each_h - 2)
+                    .x(geo.x)
+                    .y(geo.y)
+                    .width(geo.w as u32)
+                    .height(geo.h as u32)
                     .border_width(1);
                 self.ctx.conn.configure_window(win, &aux)?;
             }
@@ -589,14 +902,13 @@ impl Daily {
         Ok(())
     }
 
-    fn focused_monitor(&mut self) -> Result<Option<usize>> {
+    fn focused_monitor(&mut self) -> Option<usize> {
         if let Some(window) = self.windows.get(&self.focus) {
-            Ok(self.screens[window.screen].monitor)
+            self.screens[window.screen].monitor
         } else {
-            Ok(self
-                .monitors
+            self.monitors
                 .iter()
-                .position(|mon| mon.dummy_window == self.focus))
+                .position(|mon| mon.dummy_window == self.focus)
         }
     }
 }

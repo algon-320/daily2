@@ -9,57 +9,62 @@ fn main() {
     // NOTE: it might be better to move the management of keybindings into another process
     //       and use D-bus like message passing for controling the window manager.
     use x11rb::protocol::xproto::ModMask;
-    let shift_super = ModMask::SHIFT | ModMask::M4;
-    let super_ = ModMask::M4;
+    let alt_shift = ModMask::M1 | ModMask::SHIFT;
+    let alt = ModMask::M1;
     let keycode_1 = 10;
     let keycode_2 = 11;
     let keycode_3 = 12;
+    let keycode_4 = 13;
+    let keycode_5 = 14;
+    let keycode_6 = 15;
+    let keycode_7 = 16;
+    let keycode_8 = 17;
+    let keycode_9 = 18;
+    let keycode_0 = 19;
     let keycode_tab = 23;
     let keycode_q = 24;
     let keycode_r = 27;
     let keycode_t = 28;
     let keycode_p = 33;
+    let keycode_s = 39;
     let keycode_j = 44;
+
     daily
-        .bind_key(shift_super, keycode_q, daily::Command::Exit)
+        .bind_key(alt_shift, keycode_q, daily::Command::Exit)
         .expect("failed to add a keybinding for Exit command");
     daily
-        .bind_key(shift_super, keycode_r, daily::Command::Restart)
+        .bind_key(alt_shift, keycode_r, daily::Command::Restart)
         .expect("failed to add a keybinding for Restart command");
-    let cmd_dmenu = daily::Command::SpawnProcess("/usr/bin/dmenu_run".to_owned());
+    let cmd_dmenu = daily::Command::SpawnProcess("/home/algon/scripts/dmenu/run.sh".to_owned());
     daily
-        .bind_key(super_, keycode_p, cmd_dmenu)
+        .bind_key(alt, keycode_p, cmd_dmenu)
         .expect("failed to add a keybinding for dmenu");
-    let cmd_term = daily::Command::SpawnProcess("/usr/bin/alacritty".to_owned());
+    let cmd_term = daily::Command::SpawnProcess("/home/algon/.cargo/bin/toyterm".to_owned());
     daily
-        .bind_key(super_, keycode_t, cmd_term)
+        .bind_key(alt, keycode_t, cmd_term)
         .expect("failed to add a keybinding for terminal");
     daily
-        .bind_key(super_, keycode_j, daily::Command::FocusNextMonitor)
+        .bind_key(alt, keycode_j, daily::Command::FocusNextMonitor)
         .expect("failed to add a keybinding for FocusNextMonitor command");
     daily
-        .bind_key(super_, keycode_tab, daily::Command::FocusNextWindow)
+        .bind_key(alt, keycode_tab, daily::Command::FocusNextWindow)
         .expect("failed to add a keybinding for FocusNextWindow command");
+    daily
+        .bind_key(alt, keycode_s, daily::Command::ToggleFloating)
+        .expect("failed to add a keybinding for ToggleFloating command");
 
-    daily
-        .bind_key(super_, keycode_1, daily::Command::ChangeScreen(0))
-        .expect("failed to add a keybinding for ChangeScreen(0) command");
-    daily
-        .bind_key(super_, keycode_2, daily::Command::ChangeScreen(1))
-        .expect("failed to add a keybinding for ChangeScreen(1) command");
-    daily
-        .bind_key(super_, keycode_3, daily::Command::ChangeScreen(2))
-        .expect("failed to add a keybinding for ChangeScreen(2) command");
-
-    daily
-        .bind_key(shift_super, keycode_1, daily::Command::MoveWindow(0))
-        .expect("failed to add a keybinding for MoveWindow(0) command");
-    daily
-        .bind_key(shift_super, keycode_2, daily::Command::MoveWindow(1))
-        .expect("failed to add a keybinding for MoveWindow(1) command");
-    daily
-        .bind_key(shift_super, keycode_3, daily::Command::MoveWindow(2))
-        .expect("failed to add a keybinding for MoveWindow(2) command");
+    let digit_keys = [
+        keycode_1, keycode_2, keycode_3, keycode_4, keycode_5, keycode_6, keycode_7, keycode_8,
+        keycode_9, keycode_0,
+    ];
+    for (i, kc) in digit_keys.into_iter().enumerate() {
+        daily
+            .bind_key(alt, kc, daily::Command::ChangeScreen(i))
+            .expect("failed to add a keybinding for ChangeScreen command");
+        daily
+            .bind_key(alt_shift, kc, daily::Command::MoveWindow(i))
+            .expect("failed to add a keybinding for MoveWindow command");
+    }
 
     log::info!("start");
     match daily.start() {
