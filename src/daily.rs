@@ -1,113 +1,3 @@
-mod utils {
-    use std::rc::Rc;
-
-    use x11rb::connection::Connection as _;
-    use x11rb::protocol::xproto;
-    use x11rb::rust_connection::RustConnection;
-    use xproto::ConnectionExt as _;
-
-    use crate::error::Result;
-
-    x11rb::atom_manager! {
-        pub AtomCollection: AtomCollectionCookie {
-            _NET_SUPPORTED,
-            _NET_SUPPORTING_WM_CHECK,
-            _NET_WM_ALLOWED_ACTIONS,
-            _NET_WM_ACTION_FULLSCREEN,
-            _NET_WM_MOVERESIZE,
-            _NET_MOVERESIZE_WINDOW,
-            _NET_WM_STATE,
-            _NET_WM_STATE_FULLSCREEN,
-            _NET_WM_WINDOW_TYPE,
-            _NET_WM_WINDOW_TYPE_DIALOG,
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct Context {
-        pub conn: Rc<RustConnection>,
-        pub root: xproto::Window,
-        pub atom: AtomCollection,
-    }
-
-    impl Context {
-        pub fn new() -> Result<Self> {
-            let conn = match RustConnection::connect(None) {
-                Ok((conn, _)) => conn,
-                Err(err) => {
-                    panic!("Failed to connect with the X server: {}", err);
-                }
-            };
-            let root = conn.setup().roots[0].root;
-            let atom = AtomCollection::new(&conn)?.reply()?;
-            Ok(Self {
-                conn: Rc::new(conn),
-                root,
-                atom,
-            })
-        }
-    }
-
-    pub fn get_atom_name(ctx: &Context, atom: xproto::Atom) -> Result<String> {
-        let name_reply = ctx.conn.get_atom_name(atom)?.reply()?;
-        let len = name_reply.name_len() as usize;
-        let bytes = &name_reply.name.as_slice()[..len];
-        let name = std::str::from_utf8(bytes).unwrap().to_owned();
-        Ok(name)
-    }
-
-    pub fn get_net_wm_window_type(
-        ctx: &Context,
-        window: xproto::Window,
-    ) -> Result<Option<xproto::Atom>> {
-        let net_wm_type = ctx.atom._NET_WM_WINDOW_TYPE;
-        Ok(ctx
-            .conn
-            .get_property(false, window, net_wm_type, xproto::AtomEnum::ATOM, 0, 1)?
-            .reply()?
-            .value32()
-            .and_then(|mut iter| iter.next()))
-    }
-
-    pub enum Property<'a> {
-        Window(xproto::Window),
-        AtomList(&'a [xproto::Atom]),
-    }
-
-    pub fn replace_property(
-        ctx: &Context,
-        target: xproto::Window,
-        key: xproto::Atom,
-        value: Property<'_>,
-    ) -> Result<()> {
-        let (type_, format, data): (xproto::AtomEnum, u8, Vec<u8>);
-        match value {
-            Property::Window(window) => {
-                type_ = xproto::AtomEnum::WINDOW;
-                format = 32;
-                data = window.to_ne_bytes().to_vec();
-            }
-            Property::AtomList(atoms) => {
-                type_ = xproto::AtomEnum::ATOM;
-                format = 32;
-                data = atoms.iter().flat_map(|a| a.to_ne_bytes()).collect();
-            }
-        };
-
-        ctx.conn.change_property(
-            xproto::PropMode::REPLACE,
-            target,
-            key,
-            type_,
-            format,
-            (data.len() as u32) / (format as u32 / 8),
-            &data,
-        )?;
-        ctx.conn.flush()?;
-        Ok(())
-    }
-}
-
 use std::collections::{HashMap, VecDeque};
 
 use x11rb::connection::Connection as _;
@@ -118,6 +8,7 @@ use shape::ConnectionExt as _;
 use xproto::ConnectionExt as _;
 
 use crate::error::{Error, Result};
+use crate::utils;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -254,89 +145,6 @@ impl Daily {
     pub fn start(mut self) -> Result<()> {
         self.init()?;
 
-        // FIXME: border
-        {
-            let (mut visual, mut depth) = (x11rb::COPY_FROM_PARENT, x11rb::COPY_DEPTH_FROM_PARENT);
-            {
-                let setup = self.ctx.conn.setup();
-                dbg!(&setup.roots);
-                for d in setup.roots[0].allowed_depths.iter() {
-                    if d.depth != 32 {
-                        continue;
-                    }
-
-                    for v in d.visuals.iter() {
-                        if v.class == xproto::VisualClass::TRUE_COLOR && v.bits_per_rgb_value == 8 {
-                            visual = v.visual_id;
-                            depth = 32;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let colormap = self.ctx.conn.generate_id()?;
-            self.ctx
-                .conn
-                .create_colormap(xproto::ColormapAlloc::NONE, colormap, self.ctx.root, visual)?
-                .check()?;
-
-            let x = 0;
-            let y = 0;
-            let width = 100;
-            let height = 100;
-            let bwidth = 2;
-
-            let window = self.ctx.conn.generate_id()?;
-            let class = xproto::WindowClass::INPUT_OUTPUT;
-
-            let alpha = 0x80;
-            let (red, green, blue) = (0xA3, 0x7A, 0x29);
-            let bg_color = (alpha << 24)
-                | (((red * alpha) >> 8) << 16)
-                | (((green * alpha) >> 8) << 8)
-                | ((blue * alpha) >> 8);
-
-            let aux = xproto::CreateWindowAux::new()
-                .colormap(colormap)
-                .border_pixel(0xFFfaab23)
-                .background_pixel(bg_color);
-            self.ctx
-                .conn
-                .create_window(
-                    depth,
-                    window,
-                    self.ctx.root,
-                    x,
-                    y,
-                    width,
-                    height,
-                    bwidth,
-                    class,
-                    visual,
-                    &aux,
-                )?
-                .check()?;
-
-            // self.ctx.conn.shape_rectangles(
-            //     shape::SO::SUBTRACT,
-            //     shape::SK::BOUNDING,
-            //     xproto::ClipOrdering::UNSORTED,
-            //     window,
-            //     0,
-            //     0,
-            //     &[xproto::Rectangle {
-            //         x: 0,
-            //         y: 0,
-            //         width: width - 2 * bwidth,
-            //         height: height - 2 * bwidth,
-            //     }],
-            // )?;
-            self.ctx.conn.flush()?;
-
-            self.border = window;
-        }
-
         let mut cmdq = VecDeque::new();
         loop {
             let event = self.ctx.conn.wait_for_event()?;
@@ -423,6 +231,89 @@ impl Daily {
                 self.ctx.atom._NET_SUPPORTING_WM_CHECK,
                 utils::Property::Window(ewmh_dummy_window),
             )?;
+        }
+
+        // FIXME: border
+        {
+            let (mut visual, mut depth) = (x11rb::COPY_FROM_PARENT, x11rb::COPY_DEPTH_FROM_PARENT);
+            {
+                let setup = self.ctx.conn.setup();
+                dbg!(&setup.roots);
+                for d in setup.roots[0].allowed_depths.iter() {
+                    if d.depth != 32 {
+                        continue;
+                    }
+
+                    for v in d.visuals.iter() {
+                        if v.class == xproto::VisualClass::TRUE_COLOR && v.bits_per_rgb_value == 8 {
+                            visual = v.visual_id;
+                            depth = 32;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let colormap = self.ctx.conn.generate_id()?;
+            self.ctx
+                .conn
+                .create_colormap(xproto::ColormapAlloc::NONE, colormap, self.ctx.root, visual)?
+                .check()?;
+
+            let x = 0;
+            let y = 0;
+            let width = 100;
+            let height = 100;
+            let bwidth = 2;
+
+            let window = self.ctx.conn.generate_id()?;
+            let class = xproto::WindowClass::INPUT_OUTPUT;
+
+            let alpha = 0x80;
+            let (red, green, blue) = (0xA3, 0x7A, 0x29);
+            let bg_color = (alpha << 24)
+                | (((red * alpha) >> 8) << 16)
+                | (((green * alpha) >> 8) << 8)
+                | ((blue * alpha) >> 8);
+
+            let aux = xproto::CreateWindowAux::new()
+                .colormap(colormap)
+                .border_pixel(0xFFfaab23)
+                .background_pixel(bg_color);
+            self.ctx
+                .conn
+                .create_window(
+                    depth,
+                    window,
+                    self.ctx.root,
+                    x,
+                    y,
+                    width,
+                    height,
+                    bwidth,
+                    class,
+                    visual,
+                    &aux,
+                )?
+                .check()?;
+
+            // self.ctx.conn.shape_rectangles(
+            //     shape::SO::SUBTRACT,
+            //     shape::SK::BOUNDING,
+            //     xproto::ClipOrdering::UNSORTED,
+            //     window,
+            //     0,
+            //     0,
+            //     &[xproto::Rectangle {
+            //         x: 0,
+            //         y: 0,
+            //         width: width - 2 * bwidth,
+            //         height: height - 2 * bwidth,
+            //     }],
+            // )?;
+            self.ctx.conn.flush()?;
+
+            self.border = window;
         }
 
         // setup for screens
@@ -1107,7 +998,7 @@ impl Daily {
             }
 
             _ => {
-                log::trace!("unhandled event: {event:?}");
+                log::trace!("unhandled");
             }
         }
         Ok(())
@@ -1253,6 +1144,7 @@ impl Daily {
                             let aux = xproto::ConfigureWindowAux::new()
                                 .stack_mode(xproto::StackMode::ABOVE);
                             self.ctx.conn.configure_window(window.id, &aux)?;
+                            self.ctx.conn.flush()?;
                         }
                         if let Some(monitor) = self.screens[window.screen].monitor {
                             self.update_layout(monitor)?;
@@ -1349,7 +1241,6 @@ impl Daily {
                     .border_width(1);
                 self.ctx.conn.configure_window(win, &aux)?;
             }
-            self.ctx.conn.flush()?;
         }
 
         // floating windows

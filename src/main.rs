@@ -1,4 +1,5 @@
 mod daily;
+mod utils;
 mod error;
 
 fn main() {
