@@ -1,47 +1,123 @@
+mod utils {
+    use std::rc::Rc;
+
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto;
+    use x11rb::rust_connection::RustConnection;
+    use xproto::ConnectionExt as _;
+
+    use crate::error::Result;
+
+    x11rb::atom_manager! {
+        pub AtomCollection: AtomCollectionCookie {
+            _NET_SUPPORTED,
+            _NET_SUPPORTING_WM_CHECK,
+            _NET_WM_ALLOWED_ACTIONS,
+            _NET_WM_ACTION_FULLSCREEN,
+            _NET_WM_MOVERESIZE,
+            _NET_MOVERESIZE_WINDOW,
+            _NET_WM_STATE,
+            _NET_WM_STATE_FULLSCREEN,
+            _NET_WM_WINDOW_TYPE,
+            _NET_WM_WINDOW_TYPE_DIALOG,
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct Context {
+        pub conn: Rc<RustConnection>,
+        pub root: xproto::Window,
+        pub atom: AtomCollection,
+    }
+
+    impl Context {
+        pub fn new() -> Result<Self> {
+            let conn = match RustConnection::connect(None) {
+                Ok((conn, _)) => conn,
+                Err(err) => {
+                    panic!("Failed to connect with the X server: {}", err);
+                }
+            };
+            let root = conn.setup().roots[0].root;
+            let atom = AtomCollection::new(&conn)?.reply()?;
+            Ok(Self {
+                conn: Rc::new(conn),
+                root,
+                atom,
+            })
+        }
+    }
+
+    pub fn get_atom_name(ctx: &Context, atom: xproto::Atom) -> Result<String> {
+        let name_reply = ctx.conn.get_atom_name(atom)?.reply()?;
+        let len = name_reply.name_len() as usize;
+        let bytes = &name_reply.name.as_slice()[..len];
+        let name = std::str::from_utf8(bytes).unwrap().to_owned();
+        Ok(name)
+    }
+
+    pub fn get_net_wm_window_type(
+        ctx: &Context,
+        window: xproto::Window,
+    ) -> Result<Option<xproto::Atom>> {
+        let net_wm_type = ctx.atom._NET_WM_WINDOW_TYPE;
+        Ok(ctx
+            .conn
+            .get_property(false, window, net_wm_type, xproto::AtomEnum::ATOM, 0, 1)?
+            .reply()?
+            .value32()
+            .and_then(|mut iter| iter.next()))
+    }
+
+    pub enum Property<'a> {
+        Window(xproto::Window),
+        AtomList(&'a [xproto::Atom]),
+    }
+
+    pub fn replace_property(
+        ctx: &Context,
+        target: xproto::Window,
+        key: xproto::Atom,
+        value: Property<'_>,
+    ) -> Result<()> {
+        let (type_, format, data): (xproto::AtomEnum, u8, Vec<u8>);
+        match value {
+            Property::Window(window) => {
+                type_ = xproto::AtomEnum::WINDOW;
+                format = 32;
+                data = window.to_ne_bytes().to_vec();
+            }
+            Property::AtomList(atoms) => {
+                type_ = xproto::AtomEnum::ATOM;
+                format = 32;
+                data = atoms.iter().flat_map(|a| a.to_ne_bytes()).collect();
+            }
+        };
+
+        ctx.conn.change_property(
+            xproto::PropMode::REPLACE,
+            target,
+            key,
+            type_,
+            format,
+            (data.len() as u32) / (format as u32 / 8),
+            &data,
+        )?;
+        ctx.conn.flush()?;
+        Ok(())
+    }
+}
+
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
 
 use x11rb::connection::Connection as _;
 use x11rb::protocol::{randr, shape, xproto, Event};
-use x11rb::rust_connection::RustConnection;
 
 use randr::ConnectionExt as _;
 use shape::ConnectionExt as _;
 use xproto::ConnectionExt as _;
 
 use crate::error::{Error, Result};
-
-x11rb::atom_manager! {
-    pub AtomCollection: AtomCollectionCookie {
-        _NET_WM_WINDOW_TYPE,
-        _NET_WM_WINDOW_TYPE_DIALOG,
-    }
-}
-
-#[derive(Clone)]
-pub struct Context {
-    pub conn: Rc<RustConnection>,
-    pub root: xproto::Window,
-    pub atom: AtomCollection,
-}
-
-impl Context {
-    pub fn new() -> Result<Self> {
-        let conn = match RustConnection::connect(None) {
-            Ok((conn, _)) => conn,
-            Err(err) => {
-                panic!("Failed to connect with the X server: {}", err);
-            }
-        };
-        let root = conn.setup().roots[0].root;
-        let atom = AtomCollection::new(&conn)?.reply()?;
-        Ok(Self {
-            conn: Rc::new(conn),
-            root,
-            atom,
-        })
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -105,6 +181,7 @@ struct Window {
     screen: usize,
     mapped: bool,
     floating: bool,
+    fullscreen: bool,
 
     /// a region occupied by this window (coordinates are relative to the monitor region)
     geometry: Rect,
@@ -118,7 +195,7 @@ struct Window {
 }
 
 pub struct Daily {
-    ctx: Context,
+    ctx: utils::Context,
     keybind: HashMap<(u16, u8), Command>,
     windows: HashMap<xproto::Window, Window>,
     monitors: Vec<Monitor>,
@@ -132,11 +209,10 @@ pub struct Daily {
     border_geometry: Rect,
 }
 
-// public interfaces
 impl Daily {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            ctx: Context::new()?,
+            ctx: utils::Context::new()?,
             keybind: HashMap::new(),
             windows: HashMap::new(),
             monitors: Vec::new(),
@@ -178,7 +254,7 @@ impl Daily {
     pub fn start(mut self) -> Result<()> {
         self.init()?;
 
-        // FIXME
+        // FIXME: border
         {
             let (mut visual, mut depth) = (x11rb::COPY_FROM_PARENT, x11rb::COPY_DEPTH_FROM_PARENT);
             {
@@ -296,7 +372,57 @@ impl Daily {
                 .conn
                 .change_window_attributes(self.ctx.root, &aux)?
                 .check()?;
-            self.ctx.conn.flush()?;
+
+            // _NET_SUPPORTED
+            let hints = [
+                self.ctx.atom._NET_SUPPORTING_WM_CHECK,
+                self.ctx.atom._NET_WM_ALLOWED_ACTIONS,
+                self.ctx.atom._NET_WM_ACTION_FULLSCREEN,
+                self.ctx.atom._NET_WM_STATE,
+                self.ctx.atom._NET_WM_STATE_FULLSCREEN,
+                self.ctx.atom._NET_WM_WINDOW_TYPE,
+                self.ctx.atom._NET_WM_WINDOW_TYPE_DIALOG,
+                self.ctx.atom._NET_WM_MOVERESIZE,
+                self.ctx.atom._NET_MOVERESIZE_WINDOW,
+            ];
+            utils::replace_property(
+                &self.ctx,
+                self.ctx.root,
+                self.ctx.atom._NET_SUPPORTED,
+                utils::Property::AtomList(&hints),
+            )?;
+
+            // _NET_SUPPORTING_WM_CHECK
+            let ewmh_dummy_window = self.ctx.conn.generate_id()?;
+            let depth = x11rb::COPY_DEPTH_FROM_PARENT;
+            let class = xproto::WindowClass::INPUT_ONLY;
+            let visual = x11rb::COPY_FROM_PARENT;
+            let aux = xproto::CreateWindowAux::new();
+            self.ctx.conn.create_window(
+                depth,
+                ewmh_dummy_window,
+                self.ctx.root,
+                -1, // x
+                -1, // y
+                1,  // width
+                1,  // height
+                0,  // border-width
+                class,
+                visual,
+                &aux,
+            )?;
+            utils::replace_property(
+                &self.ctx,
+                self.ctx.root,
+                self.ctx.atom._NET_SUPPORTING_WM_CHECK,
+                utils::Property::Window(ewmh_dummy_window),
+            )?;
+            utils::replace_property(
+                &self.ctx,
+                ewmh_dummy_window,
+                self.ctx.atom._NET_SUPPORTING_WM_CHECK,
+                utils::Property::Window(ewmh_dummy_window),
+            )?;
         }
 
         // setup for screens
@@ -412,10 +538,9 @@ impl Daily {
     }
 
     fn handle_event(&mut self, event: Event, cmdq: &mut VecDeque<Command>) -> Result<()> {
-        log::debug!("new event: {event:?}");
+        log::trace!("handle_event: {event:?}");
         match event {
             Event::KeyPress(key_press) => {
-                log::trace!("KeyPress: {event:?}");
                 let keys: (u16, u8) = (key_press.state.into(), key_press.detail);
                 if let Some(cmd) = self.keybind.get(&keys).cloned() {
                     cmdq.push_back(cmd);
@@ -423,7 +548,6 @@ impl Daily {
             }
 
             Event::ButtonPress(button_press) => {
-                log::trace!("ButtonPress: {event:?}");
                 self.button_count += 1;
 
                 let x = button_press.root_x as i32;
@@ -463,7 +587,6 @@ impl Daily {
             }
 
             Event::MotionNotify(motion) => {
-                log::debug!("MotionNotify: {motion:?}");
                 if let Some((prev_x, prev_y)) = self.dnd_position {
                     let x = motion.root_x as i32;
                     let y = motion.root_y as i32;
@@ -639,7 +762,6 @@ impl Daily {
             }
 
             Event::ButtonRelease(button_release) => {
-                log::debug!("ButtonRelease: {button_release:?}");
                 self.button_count -= 1;
 
                 let x = button_release.root_x as i32;
@@ -756,11 +878,12 @@ impl Daily {
                             h: geo.height as i32,
                         },
                         floating: false,
+                        fullscreen: false,
                         ignore_unmap_notify: false,
                     };
 
-                    // put this window at the center of the monitor if its type is dialog
-                    if get_net_wm_window_type(&self.ctx, window.id)?
+                    // place this window at the center of the monitor if its type is dialog
+                    if utils::get_net_wm_window_type(&self.ctx, window.id)?
                         == Some(self.ctx.atom._NET_WM_WINDOW_TYPE_DIALOG)
                     {
                         window.floating = true;
@@ -769,6 +892,15 @@ impl Daily {
                         window.geometry.x = center_x - window.geometry.w / 2;
                         window.geometry.y = center_y - window.geometry.h / 2;
                     }
+
+                    // _NET_WM_ALLOWED_ACTIONS
+                    let actions = [self.ctx.atom._NET_WM_ACTION_FULLSCREEN];
+                    utils::replace_property(
+                        &self.ctx,
+                        window.id,
+                        self.ctx.atom._NET_WM_ALLOWED_ACTIONS,
+                        utils::Property::AtomList(&actions),
+                    )?;
 
                     let window_id = window.id;
                     log::debug!("window 0x{:X} added on screen {}", window_id, screen);
@@ -905,6 +1037,72 @@ impl Daily {
                     let aux = xproto::ConfigureWindowAux::from_configure_request(&req);
                     self.ctx.conn.configure_window(req.window, &aux)?;
                     self.ctx.conn.flush()?;
+                }
+            }
+
+            Event::ClientMessage(msg) => {
+                log::debug!(
+                    "ClientMessage({}): {:?}",
+                    utils::get_atom_name(&self.ctx, msg.type_)?,
+                    msg
+                );
+
+                // FIXME: tidy up this part
+                if msg.type_ == self.ctx.atom._NET_WM_STATE {
+                    let action = msg.data.as_data32()[0];
+                    let first = msg.data.as_data32()[1];
+                    let second = msg.data.as_data32()[2];
+
+                    if action == 0 {
+                        log::debug!("actioin: _NET_WM_STATE_REMOVE");
+                    } else if action == 1 {
+                        log::debug!("actioin: _NET_WM_STATE_ADD");
+                    } else if action == 2 {
+                        log::debug!("actioin: _NET_WM_STATE_TOGGLE");
+                    }
+
+                    log::debug!("first: {}", utils::get_atom_name(&self.ctx, first)?);
+                    if second != 0 {
+                        log::debug!("second: {}", utils::get_atom_name(&self.ctx, second)?);
+                    }
+
+                    if first == self.ctx.atom._NET_WM_STATE_FULLSCREEN
+                        || second == self.ctx.atom._NET_WM_STATE_FULLSCREEN
+                    {
+                        if action == 0 {
+                            // REMOVE
+                            if let Some(window) = self.windows.get_mut(&msg.window) {
+                                window.fullscreen = false;
+                                if let Some(monitor) = self.screens[window.screen].monitor {
+                                    self.update_layout(monitor)?;
+                                }
+
+                                let state = [];
+                                utils::replace_property(
+                                    &self.ctx,
+                                    msg.window,
+                                    self.ctx.atom._NET_WM_STATE,
+                                    utils::Property::AtomList(&state),
+                                )?;
+                            }
+                        } else if action == 1 {
+                            // SET/ADD
+                            if let Some(window) = self.windows.get_mut(&msg.window) {
+                                window.fullscreen = true;
+                                if let Some(monitor) = self.screens[window.screen].monitor {
+                                    self.update_layout(monitor)?;
+                                }
+
+                                let state = [self.ctx.atom._NET_WM_STATE_FULLSCREEN];
+                                utils::replace_property(
+                                    &self.ctx,
+                                    msg.window,
+                                    self.ctx.atom._NET_WM_STATE,
+                                    utils::Property::AtomList(&state),
+                                )?;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1076,6 +1274,7 @@ impl Daily {
         self.focus = new_focus;
 
         log::debug!("focus on window 0x{:X} ({})", new_focus, new_focus);
+
         // TODO: config
         if self.windows.contains_key(&old_focus) {
             let aux = xproto::ChangeWindowAttributesAux::new().border_pixel(0x000000);
@@ -1118,7 +1317,7 @@ impl Daily {
         let mon_geo = self.monitors[monitor].geometry;
 
         let targets: Vec<xproto::Window> = mapped_windows!(self, screen)
-            .filter(|win| !win.floating)
+            .filter(|win| !win.floating && !win.fullscreen)
             .map(|win| win.id)
             .collect();
 
@@ -1163,12 +1362,24 @@ impl Daily {
                 .border_width(1);
             self.ctx.conn.configure_window(win.id, &aux)?;
         }
-        self.ctx.conn.flush()?;
+
+        // fullscreen windows
+        for win in mapped_windows!(self, screen).filter(|win| win.fullscreen) {
+            let aux = xproto::ConfigureWindowAux::new()
+                .stack_mode(xproto::StackMode::ABOVE)
+                .x(mon_geo.x)
+                .y(mon_geo.y)
+                .width(mon_geo.w as u32)
+                .height(mon_geo.h as u32)
+                .border_width(0);
+            self.ctx.conn.configure_window(win.id, &aux)?;
+        }
 
         // FIXME
         let aux = xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE);
         self.ctx.conn.configure_window(self.border, &aux)?;
 
+        self.ctx.conn.flush()?;
         Ok(())
     }
 
@@ -1181,14 +1392,4 @@ impl Daily {
                 .position(|mon| mon.dummy_window == self.focus)
         }
     }
-}
-
-fn get_net_wm_window_type(ctx: &Context, window: xproto::Window) -> Result<Option<xproto::Atom>> {
-    let net_wm_type = ctx.atom._NET_WM_WINDOW_TYPE;
-    Ok(ctx
-        .conn
-        .get_property(false, window, net_wm_type, xproto::AtomEnum::ATOM, 0, 1)?
-        .reply()?
-        .value32()
-        .and_then(|mut iter| iter.next()))
 }
