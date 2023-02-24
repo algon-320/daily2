@@ -7,6 +7,7 @@ use randr::ConnectionExt as _;
 use shape::ConnectionExt as _;
 use xproto::ConnectionExt as _;
 
+use crate::config;
 use crate::error::{Error, Result};
 use crate::utils;
 
@@ -74,7 +75,7 @@ struct Window {
     floating: bool,
     fullscreen: bool,
 
-    /// a region occupied by this window (coordinates are relative to the monitor region)
+    /// a region occupied by this window, not-including borders (coordinates are relative to the monitor region)
     geometry: Rect,
 
     // NOTE:
@@ -83,6 +84,33 @@ struct Window {
     // so when we (actively) unmap a window turn on this flag and test it on UnmapNotifyEvents.
     // Is there any better way to deal with this issue?
     ignore_unmap_notify: bool,
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    Shift,
+    Control,
+    Super,
+    Alt,
+}
+
+impl Modifier {
+    pub fn keybutmask(&self) -> xproto::KeyButMask {
+        match self {
+            Modifier::Shift => xproto::KeyButMask::SHIFT,
+            Modifier::Control => xproto::KeyButMask::CONTROL,
+
+            // FIXME
+            Modifier::Super => xproto::KeyButMask::MOD4,
+            Modifier::Alt => xproto::KeyButMask::MOD1,
+        }
+    }
+
+    pub fn modmask(&self) -> xproto::ModMask {
+        let keybutmask = self.keybutmask();
+        u16::from(keybutmask).into()
+    }
 }
 
 pub struct Daily {
@@ -117,28 +145,29 @@ impl Daily {
         })
     }
 
-    pub fn bind_key(
-        &mut self,
-        modifiers: xproto::ModMask,
-        keycode: u8,
-        cmd: Command,
-    ) -> Result<()> {
+    pub fn bind_key(&mut self, modifiers: &[Modifier], keycode: u8, cmd: Command) -> Result<()> {
+        let mut modmask = xproto::ModMask::default();
+        for m in modifiers {
+            modmask = modmask | m.modmask();
+        }
+
         self.ctx
             .conn
             .grab_key(
                 false,
                 self.ctx.root,
-                modifiers,
+                modmask,
                 keycode,
                 xproto::GrabMode::ASYNC, // pointer
                 xproto::GrabMode::ASYNC, // keyboard
             )?
             .check()?;
 
-        self.keybind
-            .insert((modifiers.into(), keycode), cmd.clone());
+        self.keybind.insert((modmask.into(), keycode), cmd.clone());
 
-        log::info!("new keybinding: state={modifiers:?}, detail={keycode}, cmd={cmd:?}");
+        log::info!(
+            "new keybinding: state={modmask:?} ({modifiers:?}), detail={keycode}, cmd={cmd:?}"
+        );
         Ok(())
     }
 
@@ -260,15 +289,10 @@ impl Daily {
                 .create_colormap(xproto::ColormapAlloc::NONE, colormap, self.ctx.root, visual)?
                 .check()?;
 
-            let x = 0;
-            let y = 0;
-            let width = 100;
-            let height = 100;
-            let bwidth = 2;
-
             let window = self.ctx.conn.generate_id()?;
             let class = xproto::WindowClass::INPUT_OUTPUT;
 
+            // FIXME: config
             let alpha = 0x80;
             let (red, green, blue) = (0xA3, 0x7A, 0x29);
             let bg_color = (alpha << 24)
@@ -286,11 +310,11 @@ impl Daily {
                     depth,
                     window,
                     self.ctx.root,
-                    x,
-                    y,
-                    width,
-                    height,
-                    bwidth,
+                    -1, // x
+                    -1, // y
+                    1,  // w
+                    1,  // h
+                    0,  // border width
                     class,
                     visual,
                     &aux,
@@ -307,8 +331,8 @@ impl Daily {
             //     &[xproto::Rectangle {
             //         x: 0,
             //         y: 0,
-            //         width: width - 2 * bwidth,
-            //         height: height - 2 * bwidth,
+            //         width: width - bwidth * 2,
+            //         height: height - bwidth * 2,
             //     }],
             // )?;
             self.ctx.conn.flush()?;
@@ -452,10 +476,9 @@ impl Daily {
 
                 let mut allow = xproto::Allow::REPLAY_POINTER;
 
-                const LEFT_BUTTON: u8 = 1;
-                const RIGHT_BUTTON: u8 = 3;
-                // FIXME: config
-                if button_press.detail == LEFT_BUTTON || button_press.detail == RIGHT_BUTTON {
+                const MOUSE_L: u8 = 1;
+                const MOUSE_R: u8 = 3;
+                if matches!(button_press.detail, MOUSE_L | MOUSE_R) {
                     let focus = clicked_window.unwrap_or_else(|| {
                         let mon = self
                             .monitors
@@ -467,8 +490,8 @@ impl Daily {
                     self.change_focus(focus)?;
                 }
 
-                // FIXME: config
-                if u16::from(button_press.state) & u16::from(xproto::KeyButMask::MOD4) > 0 {
+                let hotkey = u16::from(config::HOT_KEY.keybutmask());
+                if u16::from(button_press.state) & hotkey > 0 {
                     self.dnd_position = Some((x, y));
                     allow = xproto::Allow::SYNC_POINTER;
                 }
@@ -541,8 +564,8 @@ impl Daily {
                         if let Some(monitor) =
                             self.monitors.iter().find(|mon| mon.geometry.contains(x, y))
                         {
-                            let bwidth = 4;
-                            let d = 32;
+                            let d = config::SNAPPING_WIDTH as i32;
+                            let bwidth = config::WINDOW_BORDER_WIDTH as i32;
 
                             let mg = monitor.geometry;
                             let left = mg.left() <= x && x < mg.left() + d;
@@ -554,50 +577,50 @@ impl Daily {
                             if left && top {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top();
-                                geometry.w = mg.w / 2;
-                                geometry.h = mg.h / 2;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             } else if left && bottom {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w / 2;
-                                geometry.h = mg.h - mg.h / 2;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             } else if right && top {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top();
-                                geometry.w = mg.w - mg.w / 2;
-                                geometry.h = mg.h / 2;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             } else if right && bottom {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w - mg.w / 2;
-                                geometry.h = mg.h - mg.h / 2;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             } else if left {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top();
-                                geometry.w = mg.w / 2;
-                                geometry.h = mg.h;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - bwidth * 2;
                                 border_visible = true;
                             } else if right {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top();
-                                geometry.w = mg.w - mg.w / 2;
-                                geometry.h = mg.h;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - bwidth * 2;
                                 border_visible = true;
                             } else if top {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top();
-                                geometry.w = mg.w;
-                                geometry.h = mg.h / 2;
+                                geometry.w = mg.w - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             } else if bottom {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w;
-                                geometry.h = mg.h - mg.h / 2;
+                                geometry.w = mg.w - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                                 border_visible = true;
                             }
 
@@ -608,10 +631,10 @@ impl Daily {
 
                                 let aux = xproto::ConfigureWindowAux::new()
                                     .stack_mode(xproto::StackMode::TOP_IF)
-                                    .x(geometry.x as i32)
-                                    .y(geometry.y as i32)
-                                    .width((geometry.w - 2 * bwidth) as u32)
-                                    .height((geometry.h - 2 * bwidth) as u32)
+                                    .x(geometry.x)
+                                    .y(geometry.y)
+                                    .width(geometry.w as u32)
+                                    .height(geometry.h as u32)
                                     .border_width(bwidth as u32);
                                 self.ctx.conn.configure_window(self.border, &aux)?;
 
@@ -634,8 +657,8 @@ impl Daily {
                                 //     &[xproto::Rectangle {
                                 //         x: 0,
                                 //         y: 0,
-                                //         width: (geometry.w - 2 * bwidth) as u16,
-                                //         height: (geometry.h - 2 * bwidth) as u16,
+                                //         width: geometry.w as u16,
+                                //         height: geometry.h as u16,
                                 //     }],
                                 // )?;
 
@@ -665,9 +688,8 @@ impl Daily {
                             .iter()
                             .position(|mon| mon.geometry.contains(x, y))
                         {
-                            // FIXME: config
-                            let d = 32;
-                            let border_width = 1;
+                            let d = config::SNAPPING_WIDTH as i32;
+                            let bwidth = config::WINDOW_BORDER_WIDTH as i32;
 
                             let mg = self.monitors[monitor].geometry;
                             let left = mg.left() <= x && x < mg.left() + d;
@@ -678,43 +700,43 @@ impl Daily {
                             if left && top {
                                 window.geometry.x = 0;
                                 window.geometry.y = 0;
-                                window.geometry.w = mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h / 2 - bwidth * 2;
                             } else if left && bottom {
                                 window.geometry.x = 0;
                                 window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                             } else if right && top {
                                 window.geometry.x = mg.w / 2;
                                 window.geometry.y = 0;
-                                window.geometry.w = mg.w - mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h / 2 - bwidth * 2;
                             } else if right && bottom {
                                 window.geometry.x = mg.w / 2;
                                 window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w - mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                             } else if left {
                                 window.geometry.x = 0;
                                 window.geometry.y = 0;
-                                window.geometry.w = mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h - border_width * 2;
+                                window.geometry.w = mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h - bwidth * 2;
                             } else if right {
                                 window.geometry.x = mg.w / 2;
                                 window.geometry.y = 0;
-                                window.geometry.w = mg.w - mg.w / 2 - border_width * 2;
-                                window.geometry.h = mg.h - border_width * 2;
+                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                window.geometry.h = mg.h - bwidth * 2;
                             } else if top {
                                 window.geometry.x = 0;
                                 window.geometry.y = 0;
-                                window.geometry.w = mg.w - border_width * 2;
-                                window.geometry.h = mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w - bwidth * 2;
+                                window.geometry.h = mg.h / 2 - bwidth * 2;
                             } else if bottom {
                                 window.geometry.x = 0;
                                 window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w - border_width * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - border_width * 2;
+                                window.geometry.w = mg.w - bwidth * 2;
+                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
                             }
 
                             self.update_layout(monitor)?;
@@ -843,10 +865,9 @@ impl Daily {
                     let output_change = notify.u.as_oc();
                     log::debug!("RROutputChangeNotify: {output_change:?}");
 
-                    // FIXME: config
-                    cmdq.push_back(Command::SpawnProcess(
-                        "/home/algon/.local/bin/arrange-monitors".into(),
-                    ));
+                    if let Some(prog) = config::MONITOR_UPDATE_PROG {
+                        cmdq.push_back(Command::SpawnProcess(prog.to_owned()));
+                    }
                 } else if notify.sub_code == randr::Notify::CRTC_CHANGE {
                     let crtc_change = notify.u.as_cc();
                     log::debug!("RRCrtcChangeNotify: {crtc_change:?}");
@@ -1140,12 +1161,6 @@ impl Daily {
                 Command::ToggleFloating => {
                     if let Some(window) = self.windows.get_mut(&self.focus) {
                         window.floating ^= true;
-                        if window.floating {
-                            let aux = xproto::ConfigureWindowAux::new()
-                                .stack_mode(xproto::StackMode::ABOVE);
-                            self.ctx.conn.configure_window(window.id, &aux)?;
-                            self.ctx.conn.flush()?;
-                        }
                         if let Some(monitor) = self.screens[window.screen].monitor {
                             self.update_layout(monitor)?;
                         }
@@ -1213,6 +1228,8 @@ impl Daily {
             .map(|win| win.id)
             .collect();
 
+        let bwidth = config::WINDOW_BORDER_WIDTH as i32;
+
         // NOTE: horizontal layout
         if !targets.is_empty() {
             let n = targets.len();
@@ -1228,17 +1245,18 @@ impl Daily {
                 let geo = Rect {
                     x,
                     y,
-                    w: w - 2,
-                    h: each_h - 2,
+                    w: w - bwidth * 2,
+                    h: each_h - bwidth * 2,
                 };
                 self.windows.get_mut(&win).unwrap().geometry = geo;
 
                 let aux = xproto::ConfigureWindowAux::new()
+                    .stack_mode(xproto::StackMode::ABOVE)
                     .x(mon_geo.x + geo.x)
                     .y(mon_geo.y + geo.y)
                     .width(geo.w as u32)
                     .height(geo.h as u32)
-                    .border_width(1);
+                    .border_width(bwidth as u32);
                 self.ctx.conn.configure_window(win, &aux)?;
             }
         }
@@ -1246,11 +1264,12 @@ impl Daily {
         // floating windows
         for win in mapped_windows!(self, screen).filter(|win| win.floating) {
             let aux = xproto::ConfigureWindowAux::new()
+                .stack_mode(xproto::StackMode::ABOVE)
                 .x(mon_geo.x + win.geometry.x)
                 .y(mon_geo.y + win.geometry.y)
                 .width(win.geometry.w as u32)
                 .height(win.geometry.h as u32)
-                .border_width(1);
+                .border_width(bwidth as u32);
             self.ctx.conn.configure_window(win.id, &aux)?;
         }
 
