@@ -17,7 +17,7 @@ pub enum Command {
     SpawnProcess(String),
     FocusNextMonitor,
     FocusNextWindow,
-    ChangeDesktop(usize),
+    SwitchDesktop(usize),
     MoveWindow(usize),
     ToggleFloating,
 }
@@ -1058,7 +1058,7 @@ impl Daily {
                     }
                 }
 
-                Command::ChangeDesktop(new_desktop) => {
+                Command::SwitchDesktop(new_desktop) => {
                     if let Some(monitor_a) = self.desktops[new_desktop].monitor {
                         let desktop_a = new_desktop;
                         let monitor_b = self.focused_monitor().unwrap_or(0);

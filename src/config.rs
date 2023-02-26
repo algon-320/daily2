@@ -61,7 +61,7 @@ pub fn keybindings() -> Vec<(&'static [Modifier], u8, Command)> {
         KEYCODE_9, KEYCODE_0,
     ];
     for (i, kc) in digit_keys.into_iter().enumerate() {
-        list.push((&[HOT_KEY], kc, Command::ChangeDesktop(i)));
+        list.push((&[HOT_KEY], kc, Command::SwitchDesktop(i)));
         list.push((&[HOT_KEY, Modifier::Shift], kc, Command::MoveWindow(i)));
     }
 
