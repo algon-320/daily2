@@ -77,6 +77,8 @@ struct Window {
     /// a region occupied by this window, not-including borders (coordinates are relative to the monitor region)
     geometry: Rect,
 
+    stacking_order: u64,
+
     // NOTE:
     // X11 core protocol does not provide a way to determine if an UnmapNotifyEvent was caused by
     // by this client or aother client. We are only interestead in the latter case,
@@ -123,6 +125,7 @@ pub struct Daily {
     button_count: usize,
     preview_window: xproto::Window,
     preview_geometry: Rect,
+    stacking_counter: u64,
 }
 
 impl Daily {
@@ -138,6 +141,7 @@ impl Daily {
             button_count: 0,
             preview_window: x11rb::NONE,
             preview_geometry: Rect::default(),
+            stacking_counter: 0,
         })
     }
 
@@ -463,6 +467,19 @@ impl Daily {
                         self.monitors[mon].dummy_window
                     });
                     self.change_focus(focus)?;
+
+                    if let Some(window) = self.windows.get_mut(&focus) {
+                        if window.floating {
+                            window.stacking_order = self.stacking_counter;
+                            self.stacking_counter += 1;
+
+                            let aux = xproto::ConfigureWindowAux::new()
+                                .stack_mode(xproto::StackMode::BELOW)
+                                .sibling(self.preview_window);
+                            self.ctx.conn.configure_window(window.id, &aux)?;
+                            self.ctx.conn.flush()?;
+                        }
+                    }
                 }
 
                 let hotkey = u16::from(config::HOT_KEY.keybutmask());
@@ -727,6 +744,9 @@ impl Daily {
                 if let Some(window) = self.windows.get_mut(&req.window) {
                     if let Some(monitor) = self.desktops[window.desktop].monitor {
                         window.mapped = true;
+                        window.stacking_order = self.stacking_counter;
+                        self.stacking_counter += 1;
+
                         let window_id = window.id;
                         log::debug!(
                             "window 0x{:X} is mapped on desktop {}",
@@ -739,6 +759,8 @@ impl Daily {
                     }
                 } else {
                     let geo = self.ctx.conn.get_geometry(req.window)?.reply()?;
+                    let stacking_order = self.stacking_counter;
+                    self.stacking_counter += 1;
 
                     let monitor = self.focused_monitor().unwrap_or(0);
                     let mon_geo = self.monitors[monitor].geometry;
@@ -748,14 +770,15 @@ impl Daily {
                         id: req.window,
                         desktop,
                         mapped: true,
+                        floating: false,
+                        fullscreen: false,
                         geometry: Rect {
                             x: (geo.x as i32) - mon_geo.x,
                             y: (geo.y as i32) - mon_geo.y,
                             w: geo.width as i32,
                             h: geo.height as i32,
                         },
-                        floating: false,
-                        fullscreen: false,
+                        stacking_order,
                         ignore_unmap_notify: false,
                     };
 
@@ -1210,22 +1233,23 @@ impl Daily {
 
         let desktop = self.monitors[monitor].desktop;
         let mon_geo = self.monitors[monitor].geometry;
+        let bwidth = config::WINDOW_BORDER_WIDTH as i32;
 
-        let targets: Vec<xproto::Window> = mapped_windows!(self, desktop)
+        // normal windows
+
+        let sinked_windows: Vec<xproto::Window> = mapped_windows!(self, desktop)
             .filter(|win| !win.floating && !win.fullscreen)
             .map(|win| win.id)
             .collect();
 
-        let bwidth = config::WINDOW_BORDER_WIDTH as i32;
-
         // NOTE: horizontal layout
-        if !targets.is_empty() {
-            let n = targets.len();
+        if !sinked_windows.is_empty() {
+            let n = sinked_windows.len();
             let each_w = mon_geo.w / n as i32;
             let last_w = mon_geo.w - (n as i32 - 1) * each_w;
             let each_h = mon_geo.h;
 
-            for (i, win) in targets.into_iter().enumerate() {
+            for (i, win) in sinked_windows.into_iter().enumerate() {
                 let x = each_w * (i as i32);
                 let y = 0;
                 let w = if i < n - 1 { each_w } else { last_w };
@@ -1250,7 +1274,14 @@ impl Daily {
         }
 
         // floating windows
-        for win in mapped_windows!(self, desktop).filter(|win| win.floating) {
+
+        let mut floating_windows: Vec<Window> = mapped_windows!(self, desktop)
+            .filter(|win| win.floating && !win.fullscreen)
+            .cloned()
+            .collect();
+        floating_windows.sort_by_key(|win| win.stacking_order);
+
+        for win in floating_windows {
             let aux = xproto::ConfigureWindowAux::new()
                 .stack_mode(xproto::StackMode::ABOVE)
                 .x(mon_geo.x + win.geometry.x)
@@ -1262,7 +1293,14 @@ impl Daily {
         }
 
         // fullscreen windows
-        for win in mapped_windows!(self, desktop).filter(|win| win.fullscreen) {
+
+        let mut fullscreen_windows: Vec<Window> = mapped_windows!(self, desktop)
+            .filter(|win| win.fullscreen)
+            .cloned()
+            .collect();
+        fullscreen_windows.sort_by_key(|win| win.stacking_order);
+
+        for win in fullscreen_windows {
             let aux = xproto::ConfigureWindowAux::new()
                 .stack_mode(xproto::StackMode::ABOVE)
                 .x(mon_geo.x)
