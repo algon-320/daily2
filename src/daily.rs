@@ -395,42 +395,6 @@ impl Daily {
         Ok(())
     }
 
-    fn add_monitor(&mut self, crtc: randr::Crtc, geometry: Rect, desktop: usize) -> Result<usize> {
-        let i = self.monitors.len();
-        let dummy_window = self.ctx.conn.generate_id()?;
-        log::debug!("dummy window for monitor {i}: {dummy_window}");
-
-        let depth = x11rb::COPY_DEPTH_FROM_PARENT;
-        let class = xproto::WindowClass::INPUT_ONLY;
-        let visual = x11rb::COPY_FROM_PARENT;
-        let aux = xproto::CreateWindowAux::new();
-        self.ctx.conn.create_window(
-            depth,
-            dummy_window,
-            self.ctx.root,
-            geometry.x as i16, // x
-            geometry.y as i16, // y
-            1,                 // width
-            1,                 // height
-            0,                 // border-width
-            class,
-            visual,
-            &aux,
-        )?;
-        self.ctx.conn.map_window(dummy_window)?;
-
-        self.monitors.push(Monitor {
-            crtc,
-            desktop,
-            dummy_window,
-            geometry,
-        });
-        self.desktops[desktop].monitor = Some(i);
-
-        self.update_layout(i)?;
-        Ok(i)
-    }
-
     fn handle_event(&mut self, event: Event, cmdq: &mut VecDeque<Command>) -> Result<()> {
         log::trace!("handle_event: {event:?}");
         match event {
@@ -1180,6 +1144,42 @@ impl Daily {
             }
         }
         Ok(())
+    }
+
+    fn add_monitor(&mut self, crtc: randr::Crtc, geometry: Rect, desktop: usize) -> Result<usize> {
+        let i = self.monitors.len();
+        let dummy_window = self.ctx.conn.generate_id()?;
+        log::debug!("dummy window for monitor {i}: {dummy_window}");
+
+        let depth = x11rb::COPY_DEPTH_FROM_PARENT;
+        let class = xproto::WindowClass::INPUT_ONLY;
+        let visual = x11rb::COPY_FROM_PARENT;
+        let aux = xproto::CreateWindowAux::new();
+        self.ctx.conn.create_window(
+            depth,
+            dummy_window,
+            self.ctx.root,
+            geometry.x as i16, // x
+            geometry.y as i16, // y
+            1,                 // width
+            1,                 // height
+            0,                 // border-width
+            class,
+            visual,
+            &aux,
+        )?;
+        self.ctx.conn.map_window(dummy_window)?;
+
+        self.monitors.push(Monitor {
+            crtc,
+            desktop,
+            dummy_window,
+            geometry,
+        });
+        self.desktops[desktop].monitor = Some(i);
+
+        self.update_layout(i)?;
+        Ok(i)
     }
 
     fn change_focus(&mut self, focus: xproto::Window) -> Result<()> {
