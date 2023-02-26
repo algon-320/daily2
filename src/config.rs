@@ -10,6 +10,9 @@ pub const SNAPPING_WIDTH: u32 = 64;
 // Expected usage is to specify a script that updates monitor layout using xrandr utility.
 pub const MONITOR_UPDATE_PROG: Option<&str> = Some(r#"echo 'monitor changed'"#);
 
+// maximum number of the virtual desktops
+pub const NUM_DESKTOPS: usize = 20;
+
 const KEYCODE_1: u8 = 10;
 const KEYCODE_2: u8 = 11;
 const KEYCODE_3: u8 = 12;
@@ -58,7 +61,7 @@ pub fn keybindings() -> Vec<(&'static [Modifier], u8, Command)> {
         KEYCODE_9, KEYCODE_0,
     ];
     for (i, kc) in digit_keys.into_iter().enumerate() {
-        list.push((&[HOT_KEY], kc, Command::ChangeScreen(i)));
+        list.push((&[HOT_KEY], kc, Command::ChangeDesktop(i)));
         list.push((&[HOT_KEY, Modifier::Shift], kc, Command::MoveWindow(i)));
     }
 
