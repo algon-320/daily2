@@ -1,10 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use x11rb::connection::Connection as _;
-use x11rb::protocol::{randr, shape, xproto, Event};
+use x11rb::protocol::{randr, xproto, Event};
 
 use randr::ConnectionExt as _;
-use shape::ConnectionExt as _;
 use xproto::ConnectionExt as _;
 
 use crate::config;
@@ -101,7 +100,7 @@ impl Modifier {
             Modifier::Shift => xproto::KeyButMask::SHIFT,
             Modifier::Control => xproto::KeyButMask::CONTROL,
 
-            // FIXME
+            // FIXME: these mappings can be changed
             Modifier::Super => xproto::KeyButMask::MOD4,
             Modifier::Alt => xproto::KeyButMask::MOD1,
         }
@@ -122,10 +121,8 @@ pub struct Daily {
     focus: xproto::Window,
     dnd_position: Option<(i32, i32)>,
     button_count: usize,
-
-    // FIXME
-    border: xproto::Window,
-    border_geometry: Rect,
+    preview_window: xproto::Window,
+    preview_geometry: Rect,
 }
 
 impl Daily {
@@ -139,9 +136,8 @@ impl Daily {
             focus: x11rb::NONE,
             dnd_position: None,
             button_count: 0,
-
-            border: x11rb::NONE,
-            border_geometry: Rect::default(),
+            preview_window: x11rb::NONE,
+            preview_geometry: Rect::default(),
         })
     }
 
@@ -262,24 +258,22 @@ impl Daily {
             )?;
         }
 
-        // FIXME: border
+        // create preview window
         {
             let (mut visual, mut depth) = (x11rb::COPY_FROM_PARENT, x11rb::COPY_DEPTH_FROM_PARENT);
-            {
-                let setup = self.ctx.conn.setup();
-                dbg!(&setup.roots);
-                for d in setup.roots[0].allowed_depths.iter() {
-                    if d.depth != 32 {
-                        continue;
-                    }
 
-                    for v in d.visuals.iter() {
-                        if v.class == xproto::VisualClass::TRUE_COLOR && v.bits_per_rgb_value == 8 {
-                            visual = v.visual_id;
-                            depth = 32;
-                            break;
-                        }
-                    }
+            let setup = self.ctx.conn.setup();
+            for d in setup.roots[0]
+                .allowed_depths
+                .iter()
+                .filter(|d| d.depth == 32)
+            {
+                if let Some(v) = d.visuals.iter().find(|v| {
+                    v.class == xproto::VisualClass::TRUE_COLOR && v.bits_per_rgb_value == 8
+                }) {
+                    visual = v.visual_id;
+                    depth = 32;
+                    break;
                 }
             }
 
@@ -292,7 +286,7 @@ impl Daily {
             let window = self.ctx.conn.generate_id()?;
             let class = xproto::WindowClass::INPUT_OUTPUT;
 
-            // FIXME: config
+            // FIXME: config color
             let alpha = 0x80;
             let (red, green, blue) = (0xA3, 0x7A, 0x29);
             let bg_color = (alpha << 24)
@@ -304,40 +298,22 @@ impl Daily {
                 .colormap(colormap)
                 .border_pixel(0xFFfaab23)
                 .background_pixel(bg_color);
-            self.ctx
-                .conn
-                .create_window(
-                    depth,
-                    window,
-                    self.ctx.root,
-                    -1, // x
-                    -1, // y
-                    1,  // w
-                    1,  // h
-                    0,  // border width
-                    class,
-                    visual,
-                    &aux,
-                )?
-                .check()?;
-
-            // self.ctx.conn.shape_rectangles(
-            //     shape::SO::SUBTRACT,
-            //     shape::SK::BOUNDING,
-            //     xproto::ClipOrdering::UNSORTED,
-            //     window,
-            //     0,
-            //     0,
-            //     &[xproto::Rectangle {
-            //         x: 0,
-            //         y: 0,
-            //         width: width - bwidth * 2,
-            //         height: height - bwidth * 2,
-            //     }],
-            // )?;
+            self.ctx.conn.create_window(
+                depth,
+                window,
+                self.ctx.root,
+                -1, // x
+                -1, // y
+                1,  // w
+                1,  // h
+                0,  // border width
+                class,
+                visual,
+                &aux,
+            )?;
             self.ctx.conn.flush()?;
 
-            self.border = window;
+            self.preview_window = window;
         }
 
         // setup for screens
@@ -556,11 +532,11 @@ impl Daily {
                             .width(window.geometry.w as u32)
                             .height(window.geometry.h as u32)
                             .stack_mode(xproto::StackMode::BELOW)
-                            .sibling(self.border);
+                            .sibling(self.preview_window);
                         self.ctx.conn.configure_window(window.id, &aux)?;
                         self.ctx.conn.flush()?;
 
-                        let mut border_visible = false;
+                        let mut preview_visible = false;
                         if let Some(monitor) =
                             self.monitors.iter().find(|mon| mon.geometry.contains(x, y))
                         {
@@ -579,55 +555,55 @@ impl Daily {
                                 geometry.y = mg.top();
                                 geometry.w = mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if left && bottom {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top() + mg.h / 2;
                                 geometry.w = mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if right && top {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top();
                                 geometry.w = mg.w - mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if right && bottom {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top() + mg.h / 2;
                                 geometry.w = mg.w - mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if left {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top();
                                 geometry.w = mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if right {
                                 geometry.x = mg.left() + mg.w / 2;
                                 geometry.y = mg.top();
                                 geometry.w = mg.w - mg.w / 2 - bwidth * 2;
                                 geometry.h = mg.h - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if top {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top();
                                 geometry.w = mg.w - bwidth * 2;
                                 geometry.h = mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             } else if bottom {
                                 geometry.x = mg.left();
                                 geometry.y = mg.top() + mg.h / 2;
                                 geometry.w = mg.w - bwidth * 2;
                                 geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                border_visible = true;
+                                preview_visible = true;
                             }
 
-                            if border_visible && geometry != self.border_geometry {
-                                // update border window
+                            if preview_visible && geometry != self.preview_geometry {
+                                // update preview window
 
-                                self.border_geometry = geometry;
+                                self.preview_geometry = geometry;
 
                                 let aux = xproto::ConfigureWindowAux::new()
                                     .stack_mode(xproto::StackMode::TOP_IF)
@@ -636,39 +612,15 @@ impl Daily {
                                     .width(geometry.w as u32)
                                     .height(geometry.h as u32)
                                     .border_width(bwidth as u32);
-                                self.ctx.conn.configure_window(self.border, &aux)?;
+                                self.ctx.conn.configure_window(self.preview_window, &aux)?;
 
-                                // // Using the "shape" extension
-                                // self.ctx.conn.shape_mask(
-                                //     shape::SO::SET,
-                                //     shape::SK::BOUNDING,
-                                //     self.border,
-                                //     0,
-                                //     0,
-                                //     x11rb::NONE,
-                                // )?;
-                                // self.ctx.conn.shape_rectangles(
-                                //     shape::SO::SUBTRACT,
-                                //     shape::SK::BOUNDING,
-                                //     xproto::ClipOrdering::UNSORTED,
-                                //     self.border,
-                                //     0,
-                                //     0,
-                                //     &[xproto::Rectangle {
-                                //         x: 0,
-                                //         y: 0,
-                                //         width: geometry.w as u16,
-                                //         height: geometry.h as u16,
-                                //     }],
-                                // )?;
-
-                                self.ctx.conn.map_window(self.border)?;
+                                self.ctx.conn.map_window(self.preview_window)?;
                                 self.ctx.conn.flush()?;
                             }
                         }
-                        if !border_visible {
-                            self.border_geometry = Rect::default();
-                            self.ctx.conn.unmap_window(self.border)?;
+                        if !preview_visible {
+                            self.preview_geometry = Rect::default();
+                            self.ctx.conn.unmap_window(self.preview_window)?;
                             self.ctx.conn.flush()?;
                         }
                     }
@@ -742,7 +694,7 @@ impl Daily {
                             self.update_layout(monitor)?;
                         }
 
-                        self.ctx.conn.unmap_window(self.border)?;
+                        self.ctx.conn.unmap_window(self.preview_window)?;
                         self.ctx.conn.flush()?;
                     }
                 }
@@ -1037,12 +989,14 @@ impl Daily {
                 }
 
                 Command::SpawnProcess(cmdline) => {
-                    // FIXME: make this part cleaner
-                    let shell_cmdline =
-                        format!("({cmdline} 2>&1) | sed 's/^/spawned process: /' &");
-                    let mut child = std::process::Command::new("/bin/sh")
+                    use std::process::{Command, Stdio};
+                    let shell_cmdline = format!("{cmdline} &");
+                    let mut child = Command::new("/bin/sh")
                         .arg("-c")
                         .arg(shell_cmdline)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
                         .spawn()
                         .unwrap();
                     child.wait().unwrap();
@@ -1285,9 +1239,8 @@ impl Daily {
             self.ctx.conn.configure_window(win.id, &aux)?;
         }
 
-        // FIXME
         let aux = xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE);
-        self.ctx.conn.configure_window(self.border, &aux)?;
+        self.ctx.conn.configure_window(self.preview_window, &aux)?;
 
         self.ctx.conn.flush()?;
         Ok(())
