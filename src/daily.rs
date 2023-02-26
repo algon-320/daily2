@@ -648,49 +648,62 @@ impl Daily {
                             let top = mg.top() <= y && y < mg.top() + d;
                             let bottom = mg.bottom() - d <= y && y < mg.bottom();
 
+                            let mut snapped = false;
+                            let mut geometry = Rect::default();
                             if left && top {
-                                window.geometry.x = 0;
-                                window.geometry.y = 0;
-                                window.geometry.w = mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h / 2 - bwidth * 2;
+                                geometry.x = 0;
+                                geometry.y = 0;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             } else if left && bottom {
-                                window.geometry.x = 0;
-                                window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                geometry.x = 0;
+                                geometry.y = mg.h / 2;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             } else if right && top {
-                                window.geometry.x = mg.w / 2;
-                                window.geometry.y = 0;
-                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h / 2 - bwidth * 2;
+                                geometry.x = mg.w / 2;
+                                geometry.y = 0;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             } else if right && bottom {
-                                window.geometry.x = mg.w / 2;
-                                window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                geometry.x = mg.w / 2;
+                                geometry.y = mg.h / 2;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             } else if left {
-                                window.geometry.x = 0;
-                                window.geometry.y = 0;
-                                window.geometry.w = mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h - bwidth * 2;
+                                geometry.x = 0;
+                                geometry.y = 0;
+                                geometry.w = mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - bwidth * 2;
+                                snapped = true;
                             } else if right {
-                                window.geometry.x = mg.w / 2;
-                                window.geometry.y = 0;
-                                window.geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                window.geometry.h = mg.h - bwidth * 2;
+                                geometry.x = mg.w / 2;
+                                geometry.y = 0;
+                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+                                geometry.h = mg.h - bwidth * 2;
+                                snapped = true;
                             } else if top {
-                                window.geometry.x = 0;
-                                window.geometry.y = 0;
-                                window.geometry.w = mg.w - bwidth * 2;
-                                window.geometry.h = mg.h / 2 - bwidth * 2;
+                                geometry.x = 0;
+                                geometry.y = 0;
+                                geometry.w = mg.w - bwidth * 2;
+                                geometry.h = mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             } else if bottom {
-                                window.geometry.x = 0;
-                                window.geometry.y = mg.h / 2;
-                                window.geometry.w = mg.w - bwidth * 2;
-                                window.geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                geometry.x = 0;
+                                geometry.y = mg.h / 2;
+                                geometry.w = mg.w - bwidth * 2;
+                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+                                snapped = true;
                             }
 
-                            self.update_layout(monitor)?;
+                            if snapped && window.geometry != geometry {
+                                window.geometry = geometry;
+                                self.update_layout(monitor)?;
+                            }
                         }
 
                         self.ctx.conn.unmap_window(self.preview_window)?;
