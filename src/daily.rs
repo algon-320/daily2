@@ -897,7 +897,29 @@ impl Daily {
             }
 
             Event::ConfigureRequest(req) => {
-                if !self.windows.contains_key(&req.window) {
+                if let Some(window) = self.windows.get_mut(&req.window) {
+                    if window.floating {
+                        let mut x = req.x as i32;
+                        let mut y = req.y as i32;
+
+                        if let Some(monitor) = self.screens[window.screen].monitor {
+                            x -= self.monitors[monitor].geometry.x;
+                            y -= self.monitors[monitor].geometry.y;
+                        } else {
+                            x = 0;
+                            y = 0;
+                        }
+
+                        window.geometry.x = x;
+                        window.geometry.y = y;
+                        window.geometry.w = req.width as i32;
+                        window.geometry.h = req.height as i32;
+
+                        let aux = xproto::ConfigureWindowAux::from_configure_request(&req);
+                        self.ctx.conn.configure_window(window.id, &aux)?;
+                        self.ctx.conn.flush()?;
+                    }
+                } else {
                     let aux = xproto::ConfigureWindowAux::from_configure_request(&req);
                     self.ctx.conn.configure_window(req.window, &aux)?;
                     self.ctx.conn.flush()?;
