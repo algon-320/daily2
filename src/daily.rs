@@ -53,10 +53,8 @@ struct Monitor {
     crtc: randr::Crtc,
     /// a region occupied by this monitor (absolute coordinates)
     geometry: Rect,
-
     /// ID of the desktop displayed on this monitor
     desktop: usize,
-
     /// a dummy window used to control input focus
     dummy_window: xproto::Window,
 }
@@ -310,7 +308,7 @@ impl Daily {
                 -1, // y
                 1,  // w
                 1,  // h
-                0,  // border width
+                config::WINDOW_BORDER_WIDTH as u16,
                 class,
                 visual,
                 &aux,
@@ -519,89 +517,24 @@ impl Daily {
                         if let Some(monitor) =
                             self.monitors.iter().find(|mon| mon.geometry.contains(x, y))
                         {
-                            let d = config::SNAPPING_WIDTH as i32;
-                            let bwidth = config::WINDOW_BORDER_WIDTH as i32;
-
-                            let mg = monitor.geometry;
-                            let left = mg.left() <= x && x < mg.left() + d;
-                            let right = mg.right() - d <= x && x < mg.right();
-                            let top = mg.top() <= y && y < mg.top() + d;
-                            let bottom = mg.bottom() - d <= y && y < mg.bottom();
-
-                            let mut geometry = Rect::default();
-                            if left && top {
-                                geometry.x = mg.left();
-                                geometry.y = mg.top();
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
+                            if let Some(geometry) = snap(monitor.geometry, x, y) {
                                 preview_visible = true;
-                            } else if left && bottom {
-                                geometry.x = mg.left();
-                                geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                preview_visible = true;
-                            } else if right && top {
-                                geometry.x = mg.left() + mg.w / 2;
-                                geometry.y = mg.top();
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
-                                preview_visible = true;
-                            } else if right && bottom {
-                                geometry.x = mg.left() + mg.w / 2;
-                                geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                preview_visible = true;
-                            } else if left {
-                                geometry.x = mg.left();
-                                geometry.y = mg.top();
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - bwidth * 2;
-                                preview_visible = true;
-                            } else if right {
-                                geometry.x = mg.left() + mg.w / 2;
-                                geometry.y = mg.top();
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - bwidth * 2;
-                                preview_visible = true;
-                            } else if top {
-                                geometry.x = mg.left();
-                                geometry.y = mg.top();
-                                geometry.w = mg.w - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
-                                preview_visible = true;
-                            } else if bottom {
-                                geometry.x = mg.left();
-                                geometry.y = mg.top() + mg.h / 2;
-                                geometry.w = mg.w - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                preview_visible = true;
-                            }
-
-                            if state & button1 == 0 {
-                                preview_visible = false;
-                            }
-
-                            if preview_visible && geometry != self.preview_geometry {
-                                // update preview window
-
-                                self.preview_geometry = geometry;
-
-                                let aux = xproto::ConfigureWindowAux::new()
-                                    .stack_mode(xproto::StackMode::TOP_IF)
-                                    .x(geometry.x)
-                                    .y(geometry.y)
-                                    .width(geometry.w as u32)
-                                    .height(geometry.h as u32)
-                                    .border_width(bwidth as u32);
-                                self.ctx.conn.configure_window(self.preview_window, &aux)?;
-
-                                self.ctx.conn.map_window(self.preview_window)?;
-                                self.ctx.conn.flush()?;
+                                if geometry != self.preview_geometry {
+                                    self.preview_geometry = geometry;
+                                    let aux = xproto::ConfigureWindowAux::new()
+                                        .stack_mode(xproto::StackMode::TOP_IF)
+                                        .x(geometry.x)
+                                        .y(geometry.y)
+                                        .width(geometry.w as u32)
+                                        .height(geometry.h as u32);
+                                    self.ctx.conn.configure_window(self.preview_window, &aux)?;
+                                }
                             }
                         }
-                        if !preview_visible {
+                        if state & button1 > 0 && preview_visible {
+                            self.ctx.conn.map_window(self.preview_window)?;
+                            self.ctx.conn.flush()?;
+                        } else {
                             self.preview_geometry = Rect::default();
                             self.ctx.conn.unmap_window(self.preview_window)?;
                             self.ctx.conn.flush()?;
@@ -623,70 +556,14 @@ impl Daily {
                             .iter()
                             .position(|mon| mon.geometry.contains(x, y))
                         {
-                            let d = config::SNAPPING_WIDTH as i32;
-                            let bwidth = config::WINDOW_BORDER_WIDTH as i32;
-
                             let mg = self.monitors[monitor].geometry;
-                            let left = mg.left() <= x && x < mg.left() + d;
-                            let right = mg.right() - d <= x && x < mg.right();
-                            let top = mg.top() <= y && y < mg.top() + d;
-                            let bottom = mg.bottom() - d <= y && y < mg.bottom();
-
-                            let mut snapped = false;
-                            let mut geometry = Rect::default();
-                            if left && top {
-                                geometry.x = 0;
-                                geometry.y = 0;
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            } else if left && bottom {
-                                geometry.x = 0;
-                                geometry.y = mg.h / 2;
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            } else if right && top {
-                                geometry.x = mg.w / 2;
-                                geometry.y = 0;
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            } else if right && bottom {
-                                geometry.x = mg.w / 2;
-                                geometry.y = mg.h / 2;
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            } else if left {
-                                geometry.x = 0;
-                                geometry.y = 0;
-                                geometry.w = mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - bwidth * 2;
-                                snapped = true;
-                            } else if right {
-                                geometry.x = mg.w / 2;
-                                geometry.y = 0;
-                                geometry.w = mg.w - mg.w / 2 - bwidth * 2;
-                                geometry.h = mg.h - bwidth * 2;
-                                snapped = true;
-                            } else if top {
-                                geometry.x = 0;
-                                geometry.y = 0;
-                                geometry.w = mg.w - bwidth * 2;
-                                geometry.h = mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            } else if bottom {
-                                geometry.x = 0;
-                                geometry.y = mg.h / 2;
-                                geometry.w = mg.w - bwidth * 2;
-                                geometry.h = mg.h - mg.h / 2 - bwidth * 2;
-                                snapped = true;
-                            }
-
-                            if snapped && window.geometry != geometry {
-                                window.geometry = geometry;
-                                self.update_layout(monitor)?;
+                            if let Some(mut geometry) = snap(mg, x, y) {
+                                geometry.x -= mg.x;
+                                geometry.y -= mg.y;
+                                if geometry != window.geometry {
+                                    window.geometry = geometry;
+                                    self.update_layout(monitor)?;
+                                }
                             }
                         }
                     }
@@ -701,6 +578,7 @@ impl Daily {
 
                 if self.button_count == 0 {
                     self.dnd_position = None;
+                    self.preview_geometry = Rect::default();
                     self.ctx.conn.unmap_window(self.preview_window)?;
                     self.ctx.conn.flush()?;
                 }
@@ -1329,4 +1207,69 @@ impl Daily {
                 .position(|mon| mon.dummy_window == self.focus)
         }
     }
+}
+
+fn snap(monitor_geometry: Rect, x: i32, y: i32) -> Option<Rect> {
+    let mg = monitor_geometry;
+    let d = config::SNAPPING_WIDTH as i32;
+    let bwidth = config::WINDOW_BORDER_WIDTH as i32;
+
+    let left = mg.left() <= x && x < mg.left() + d;
+    let right = mg.right() - d <= x && x < mg.right();
+    let top = mg.top() <= y && y < mg.top() + d;
+    let bottom = mg.bottom() - d <= y && y < mg.bottom();
+    let x_center = mg.x + mg.w / 2 - d <= x && x <= mg.x + mg.w / 2 + d;
+    let y_center = mg.y + mg.h / 2 - d <= y && y <= mg.y + mg.h / 2 + d;
+
+    let mut geometry = Rect::default();
+    if left && top {
+        geometry.x = mg.x;
+        geometry.y = mg.y;
+        geometry.w = mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h / 2 - bwidth * 2;
+    } else if left && bottom {
+        geometry.x = mg.x;
+        geometry.y = mg.y + mg.h / 2;
+        geometry.w = mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+    } else if right && top {
+        geometry.x = mg.x + mg.w / 2;
+        geometry.y = mg.y;
+        geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h / 2 - bwidth * 2;
+    } else if right && bottom {
+        geometry.x = mg.x + mg.w / 2;
+        geometry.y = mg.y + mg.h / 2;
+        geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+    } else if left {
+        geometry.x = mg.x;
+        geometry.y = mg.y;
+        geometry.w = mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h - bwidth * 2;
+    } else if right {
+        geometry.x = mg.x + mg.w / 2;
+        geometry.y = mg.y;
+        geometry.w = mg.w - mg.w / 2 - bwidth * 2;
+        geometry.h = mg.h - bwidth * 2;
+    } else if top {
+        geometry.x = mg.x;
+        geometry.y = mg.y;
+        geometry.w = mg.w - bwidth * 2;
+        geometry.h = mg.h / 2 - bwidth * 2;
+    } else if bottom {
+        geometry.x = mg.x;
+        geometry.y = mg.y + mg.h / 2;
+        geometry.w = mg.w - bwidth * 2;
+        geometry.h = mg.h - mg.h / 2 - bwidth * 2;
+    } else if x_center && y_center {
+        geometry.x = mg.x;
+        geometry.y = mg.y;
+        geometry.w = mg.w - bwidth * 2;
+        geometry.h = mg.h - bwidth * 2;
+    } else {
+        return None;
+    }
+
+    Some(geometry)
 }
