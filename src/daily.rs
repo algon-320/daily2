@@ -406,8 +406,6 @@ impl Daily {
             }
 
             Event::ButtonPress(button_press) => {
-                self.button_count += 1;
-
                 let x = button_press.root_x as i32;
                 let y = button_press.root_y as i32;
                 let clicked_window =
@@ -449,6 +447,7 @@ impl Daily {
                 let hotkey = u16::from(config::HOT_KEY.keybutmask());
                 if u16::from(button_press.state) & hotkey > 0 {
                     self.dnd_position = Some((x, y));
+                    self.button_count += 1;
                     allow = xproto::Allow::SYNC_POINTER;
                 }
 
@@ -580,6 +579,10 @@ impl Daily {
                                 preview_visible = true;
                             }
 
+                            if state & button1 == 0 {
+                                preview_visible = false;
+                            }
+
                             if preview_visible && geometry != self.preview_geometry {
                                 // update preview window
 
@@ -686,9 +689,6 @@ impl Daily {
                                 self.update_layout(monitor)?;
                             }
                         }
-
-                        self.ctx.conn.unmap_window(self.preview_window)?;
-                        self.ctx.conn.flush()?;
                     }
                 }
 
@@ -701,6 +701,8 @@ impl Daily {
 
                 if self.button_count == 0 {
                     self.dnd_position = None;
+                    self.ctx.conn.unmap_window(self.preview_window)?;
+                    self.ctx.conn.flush()?;
                 }
             }
 
