@@ -626,7 +626,7 @@ impl Daily {
                         ignore_unmap_notify: false,
                     };
 
-                    // place this window at the center of the monitor if its type is dialog
+                    // place this window at the center of the monitor if it is a dialog
                     if utils::get_net_wm_window_type(&self.ctx, window.id)?
                         == Some(self.ctx.atom._NET_WM_WINDOW_TYPE_DIALOG)
                     {
@@ -667,14 +667,8 @@ impl Daily {
 
                             if self.focus == window.id {
                                 let desktop = window.desktop;
-                                let any_window_on_desktop: xproto::Window =
-                                    mapped_windows!(self, desktop)
-                                        .map(|win| win.id)
-                                        .next()
-                                        .unwrap_or_else(|| self.monitors[monitor].dummy_window);
-                                self.change_focus(any_window_on_desktop)?;
+                                self.focus_any(desktop)?;
                             }
-
                             self.update_layout(monitor)?;
                         }
                     }
@@ -707,35 +701,7 @@ impl Daily {
                     if let Some(monitor) = self.monitors.iter().position(|mon| mon.crtc == crtc) {
                         if crtc_change.mode == x11rb::NONE {
                             // monitor was disabled
-
-                            let desktop = self.monitors[monitor].desktop;
-                            let wins: Vec<xproto::Window> =
-                                mapped_windows!(self, desktop).map(|win| win.id).collect();
-
-                            for window_id in wins {
-                                if self.focus == window_id {
-                                    self.change_focus(x11rb::NONE)?;
-                                }
-                                self.windows
-                                    .get_mut(&window_id)
-                                    .unwrap()
-                                    .ignore_unmap_notify = true;
-                                self.ctx.conn.unmap_window(window_id)?;
-                            }
-                            self.ctx.conn.flush()?;
-
-                            self.desktops[desktop].monitor = None;
-
-                            self.ctx
-                                .conn
-                                .destroy_window(self.monitors[monitor].dummy_window)?;
-                            self.ctx.conn.flush()?;
-
-                            self.monitors.swap_remove(monitor);
-                            if monitor < self.monitors.len() {
-                                let desktop = self.monitors[monitor].desktop;
-                                self.desktops[desktop].monitor = Some(monitor);
-                            }
+                            self.remove_monitor(monitor)?;
                         } else {
                             // monitor info was changed
                             let geometry = &mut self.monitors.get_mut(monitor).unwrap().geometry;
@@ -747,7 +713,6 @@ impl Daily {
                         }
                     } else {
                         // monitor was enabled
-
                         let desktop = self
                             .desktops
                             .iter()
@@ -759,18 +724,7 @@ impl Daily {
                             w: crtc_change.width as i32,
                             h: crtc_change.height as i32,
                         };
-                        let monitor = self.add_monitor(crtc, geometry, desktop)?;
-
-                        let mut focus = None;
-                        for window in mapped_windows!(self, desktop) {
-                            focus = Some(window.id);
-                            self.ctx.conn.map_window(window.id)?;
-                        }
-                        self.ctx.conn.flush()?;
-
-                        let focus: xproto::Window =
-                            focus.unwrap_or_else(|| self.monitors[monitor].dummy_window);
-                        self.change_focus(focus)?;
+                        self.add_monitor(crtc, geometry, desktop)?;
                     }
                 }
             }
@@ -910,11 +864,7 @@ impl Daily {
                         .unwrap_or(0);
 
                     let desktop = self.monitors[next].desktop;
-                    let any_window_on_next_monitor: xproto::Window = mapped_windows!(self, desktop)
-                        .map(|win| win.id)
-                        .next()
-                        .unwrap_or_else(|| self.monitors[next].dummy_window);
-                    self.change_focus(any_window_on_next_monitor)?;
+                    self.focus_any(desktop)?;
                 }
 
                 Command::FocusNextWindow => {
@@ -943,44 +893,19 @@ impl Daily {
                         let desktop_a = new_desktop;
                         let monitor_b = self.focused_monitor().unwrap_or(0);
                         let desktop_b = self.monitors[monitor_b].desktop;
-
                         self.monitors[monitor_a].desktop = desktop_b;
                         self.monitors[monitor_b].desktop = desktop_a;
                         self.desktops[desktop_a].monitor = Some(monitor_b);
                         self.desktops[desktop_b].monitor = Some(monitor_a);
                         self.update_layout(monitor_a)?;
                         self.update_layout(monitor_b)?;
-
-                        let any_window_on_new_desktop: xproto::Window =
-                            mapped_windows!(self, new_desktop)
-                                .map(|win| win.id)
-                                .next()
-                                .unwrap_or_else(|| self.monitors[monitor_b].dummy_window);
-                        self.change_focus(any_window_on_new_desktop)?;
+                        self.focus_any(new_desktop)?;
                     } else {
                         let monitor = self.focused_monitor().unwrap_or(0);
-                        let current_desktop = self.monitors[monitor].desktop;
-
-                        for window in mapped_windows_mut!(self, current_desktop) {
-                            window.ignore_unmap_notify = true;
-                            self.ctx.conn.unmap_window(window.id)?;
-                        }
-                        for window in mapped_windows!(self, new_desktop) {
-                            self.ctx.conn.map_window(window.id)?;
-                        }
-                        self.ctx.conn.flush()?;
-
-                        self.monitors[monitor].desktop = new_desktop;
-                        self.desktops[new_desktop].monitor = Some(monitor);
-                        self.desktops[current_desktop].monitor = None;
-                        self.update_layout(monitor)?;
-
-                        let any_window_on_new_desktop: xproto::Window =
-                            mapped_windows!(self, new_desktop)
-                                .map(|win| win.id)
-                                .next()
-                                .unwrap_or_else(|| self.monitors[monitor].dummy_window);
-                        self.change_focus(any_window_on_new_desktop)?;
+                        let old_desktop = self.monitors[monitor].desktop;
+                        self.hide_desktop(old_desktop)?;
+                        self.show_desktop(new_desktop, monitor)?;
+                        self.focus_any(new_desktop)?;
                     }
                 }
 
@@ -997,12 +922,7 @@ impl Daily {
                             self.ctx.conn.flush()?;
 
                             if self.focus == window.id {
-                                let any_window_on_desktop: xproto::Window =
-                                    mapped_windows!(self, old_desktop)
-                                        .map(|win| win.id)
-                                        .next()
-                                        .unwrap_or_else(|| self.monitors[old_monitor].dummy_window);
-                                self.change_focus(any_window_on_desktop)?;
+                                self.focus_any(old_desktop)?;
                             }
                         }
 
@@ -1024,6 +944,16 @@ impl Daily {
             }
         }
         Ok(())
+    }
+
+    fn focused_monitor(&mut self) -> Option<usize> {
+        if let Some(window) = self.windows.get(&self.focus) {
+            self.desktops[window.desktop].monitor
+        } else {
+            self.monitors
+                .iter()
+                .position(|mon| mon.dummy_window == self.focus)
+        }
     }
 
     fn add_monitor(&mut self, crtc: randr::Crtc, geometry: Rect, desktop: usize) -> Result<usize> {
@@ -1056,10 +986,37 @@ impl Daily {
             dummy_window,
             geometry,
         });
-        self.desktops[desktop].monitor = Some(i);
-
-        self.update_layout(i)?;
+        self.show_desktop(desktop, i)?;
         Ok(i)
+    }
+
+    fn remove_monitor(&mut self, monitor: usize) -> Result<()> {
+        let desktop = self.monitors[monitor].desktop;
+        self.hide_desktop(desktop)?;
+
+        let dummy_window = self.monitors[monitor].dummy_window;
+        self.ctx.conn.destroy_window(dummy_window)?;
+        self.ctx.conn.flush()?;
+
+        self.monitors.swap_remove(monitor);
+        if monitor < self.monitors.len() {
+            let desktop = self.monitors[monitor].desktop;
+            self.desktops[desktop].monitor = Some(monitor);
+        }
+        Ok(())
+    }
+
+    fn focus_any(&mut self, desktop: usize) -> Result<()> {
+        let fallback = self.desktops[desktop]
+            .monitor
+            .map(|mon| self.monitors[mon].dummy_window)
+            .unwrap_or(x11rb::NONE);
+        let any_window_on_desktop: xproto::Window = mapped_windows!(self, desktop)
+            .map(|win| win.id)
+            .next()
+            .unwrap_or(fallback);
+        self.change_focus(any_window_on_desktop)?;
+        Ok(())
     }
 
     fn change_focus(&mut self, focus: xproto::Window) -> Result<()> {
@@ -1105,6 +1062,41 @@ impl Daily {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn hide_desktop(&mut self, desktop: usize) -> Result<()> {
+        if self.desktops[desktop].monitor.is_none() {
+            return Ok(());
+        }
+
+        let mut lost_focus = false;
+        for window in mapped_windows_mut!(self, desktop) {
+            if self.focus == window.id {
+                lost_focus = true;
+            }
+            window.ignore_unmap_notify = true;
+            self.ctx.conn.unmap_window(window.id)?;
+        }
+        self.ctx.conn.flush()?;
+
+        if lost_focus {
+            self.change_focus(x11rb::NONE)?;
+        }
+
+        self.desktops[desktop].monitor = None;
+        Ok(())
+    }
+
+    fn show_desktop(&mut self, desktop: usize, monitor: usize) -> Result<()> {
+        self.desktops[desktop].monitor = Some(monitor);
+        self.monitors[monitor].desktop = desktop;
+        self.update_layout(monitor)?;
+
+        for window in mapped_windows!(self, desktop) {
+            self.ctx.conn.map_window(window.id)?;
+        }
+        self.ctx.conn.flush()?;
         Ok(())
     }
 
@@ -1196,16 +1188,6 @@ impl Daily {
 
         self.ctx.conn.flush()?;
         Ok(())
-    }
-
-    fn focused_monitor(&mut self) -> Option<usize> {
-        if let Some(window) = self.windows.get(&self.focus) {
-            self.desktops[window.desktop].monitor
-        } else {
-            self.monitors
-                .iter()
-                .position(|mon| mon.dummy_window == self.focus)
-        }
     }
 }
 
