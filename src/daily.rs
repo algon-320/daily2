@@ -406,41 +406,8 @@ impl Daily {
             Event::ButtonPress(button_press) => {
                 let x = button_press.root_x as i32;
                 let y = button_press.root_y as i32;
-                let clicked_window =
-                    if button_press.child == x11rb::NONE && button_press.event == self.ctx.root {
-                        None
-                    } else {
-                        Some(button_press.child)
-                    };
 
                 let mut allow = xproto::Allow::REPLAY_POINTER;
-
-                const MOUSE_L: u8 = 1;
-                const MOUSE_R: u8 = 3;
-                if matches!(button_press.detail, MOUSE_L | MOUSE_R) {
-                    let focus = clicked_window.unwrap_or_else(|| {
-                        let mon = self
-                            .monitors
-                            .iter()
-                            .position(|mon| mon.geometry.contains(x, y))
-                            .unwrap_or(0);
-                        self.monitors[mon].dummy_window
-                    });
-                    self.change_focus(focus)?;
-
-                    if let Some(window) = self.windows.get_mut(&focus) {
-                        if window.floating {
-                            window.stacking_order = self.stacking_counter;
-                            self.stacking_counter += 1;
-
-                            let aux = xproto::ConfigureWindowAux::new()
-                                .stack_mode(xproto::StackMode::BELOW)
-                                .sibling(self.preview_window);
-                            self.ctx.conn.configure_window(window.id, &aux)?;
-                            self.ctx.conn.flush()?;
-                        }
-                    }
-                }
 
                 let hotkey = u16::from(config::HOT_KEY.keybutmask());
                 if u16::from(button_press.state) & hotkey > 0 {
@@ -451,6 +418,41 @@ impl Daily {
 
                 self.ctx.conn.allow_events(allow, x11rb::CURRENT_TIME)?;
                 self.ctx.conn.flush()?;
+
+                let new_focus =
+                    if button_press.child == x11rb::NONE && button_press.event == self.ctx.root {
+                        let mon = self
+                            .monitors
+                            .iter()
+                            .position(|mon| mon.geometry.contains(x, y))
+                            .unwrap_or(0);
+                        Some(self.monitors[mon].dummy_window)
+                    } else if self.windows.contains_key(&button_press.child) {
+                        Some(button_press.child)
+                    } else {
+                        None
+                    };
+
+                const MOUSE_L: u8 = 1;
+                const MOUSE_R: u8 = 3;
+                if matches!(button_press.detail, MOUSE_L | MOUSE_R) {
+                    if let Some(focus) = new_focus {
+                        self.change_focus(focus)?;
+
+                        if let Some(window) = self.windows.get_mut(&focus) {
+                            if window.floating {
+                                window.stacking_order = self.stacking_counter;
+                                self.stacking_counter += 1;
+
+                                let aux = xproto::ConfigureWindowAux::new()
+                                    .stack_mode(xproto::StackMode::BELOW)
+                                    .sibling(self.preview_window);
+                                self.ctx.conn.configure_window(window.id, &aux)?;
+                                self.ctx.conn.flush()?;
+                            }
+                        }
+                    }
+                }
             }
 
             Event::MotionNotify(motion) => {
